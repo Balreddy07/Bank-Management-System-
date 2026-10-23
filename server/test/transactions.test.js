@@ -13,7 +13,12 @@ const { createTransactionRouter } = require("../src/routes/transactions");
 const ACCOUNT_NUMBER = "7811288401";
 
 class FakePool {
-  constructor({ balance = "1500.00", status = "ACTIVE", failInsert = false } = {}) {
+  constructor({
+    balance = "1500.00",
+    status = "ACTIVE",
+    failInsert = false,
+    hideTransactionReceipt = false,
+  } = {}) {
     this.account = {
       account_id: 1,
       account_number: ACCOUNT_NUMBER,
@@ -22,6 +27,7 @@ class FakePool {
     };
     this.transactions = [];
     this.failInsert = failInsert;
+    this.hideTransactionReceipt = hideTransactionReceipt;
     this.lockTail = Promise.resolve();
   }
 
@@ -74,6 +80,7 @@ class FakePool {
         }
 
         if (sql.includes("WHERE transaction_ref = ?")) {
+          if (database.hideTransactionReceipt) return [[]];
           const transaction = stagedTransaction?.transaction_ref === params[0]
             ? stagedTransaction
             : database.transactions.find((item) => item.transaction_ref === params[0]);
@@ -643,25 +650,33 @@ async function post(baseUrl, path, body) {
   return { status: response.status, body: await response.json() };
 }
 
-test("deposit updates the balance and records a secure reference", async () => {
+test("deposit updates the balance and returns a complete transaction receipt", async () => {
   const database = new FakePool();
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 500.25 });
     assert.equal(result.status, 201);
     assert.equal(result.body.account.balance, "2000.25");
     assert.match(result.body.transaction.transactionRef, /^[0-9a-f-]{36}$/i);
+    assert.equal(result.body.transaction.type, "DEPOSIT");
+    assert.equal(result.body.transaction.amount, "500.25");
+    assert.equal(result.body.transaction.balanceAfter, "2000.25");
+    assert.ok(result.body.transaction.createdAt);
     assert.equal(database.transactions.length, 1);
+    assert.equal(database.transactions[0].transaction_type, "DEPOSIT");
+    assert.equal(database.transactions[0].amount, "500.25");
+    assert.equal(database.transactions[0].balance_after, "2000.25");
   });
 });
 
-test("zero and negative amounts are rejected", async () => {
+test("zero, negative, and malformed deposit amounts are rejected", async () => {
   const database = new FakePool();
   await withApi(database, async (baseUrl) => {
-    for (const amount of [0, -1]) {
+    for (const amount of [0, -1, "100.00", "1e2", null, {}]) {
       const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount });
       assert.equal(result.status, 400);
     }
     assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
   });
 });
 
@@ -671,6 +686,7 @@ test("amounts with more than two decimal places are rejected", async () => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 10.001 });
     assert.equal(result.status, 400);
     assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
   });
 });
 
@@ -679,6 +695,8 @@ test("amounts beyond the supported monetary range are rejected", async () => {
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 10000000000 });
     assert.equal(result.status, 400);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
   });
 });
 
@@ -807,6 +825,17 @@ test("failed record insertion rolls back the balance update", async () => {
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
     assert.equal(result.status, 500);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("failed receipt lookup rolls back a deposit and does not record a transaction", async () => {
+  const database = new FakePool({ hideTransactionReceipt: true });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
+    assert.equal(result.status, 500);
+    assert.match(result.body.message, /could not be completed/i);
     assert.equal(database.account.balance, "1500.00");
     assert.equal(database.transactions.length, 0);
   });

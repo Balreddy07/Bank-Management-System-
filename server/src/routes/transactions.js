@@ -195,6 +195,12 @@ async function processBalanceChange(req, res, transactionType, databasePool) {
       [transactionRef]
     );
 
+    if (transactionRows.length === 0) {
+      const error = new Error("Transaction receipt could not be generated.");
+      error.code = "TRANSACTION_RECEIPT_MISSING";
+      throw error;
+    }
+
     await connection.commit();
     transactionStarted = false;
 

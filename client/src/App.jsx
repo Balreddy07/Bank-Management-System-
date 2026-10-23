@@ -1061,12 +1061,20 @@ export default function App() {
               {transactionResult && (
                 <div className="transaction-result" role="status">
                   <div>
-                    <span>Transaction reference</span>
+                    <span>{transactionResult.type === "DEPOSIT" ? "Deposit receipt" : "Withdrawal receipt"}</span>
                     <strong>{transactionResult.transactionRef}</strong>
+                  </div>
+                  <div>
+                    <span>Amount</span>
+                    <strong>{money(transactionResult.amount)}</strong>
                   </div>
                   <div>
                     <span>Updated balance</span>
                     <strong>{money(transactionResult.balanceAfter)}</strong>
+                  </div>
+                  <div>
+                    <span>Date and time</span>
+                    <strong>{new Date(transactionResult.createdAt).toLocaleString("en-IN")}</strong>
                   </div>
                 </div>
               )}

@@ -688,7 +688,22 @@ test("withdrawal may leave exactly the minimum balance", async () => {
     const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 });
     assert.equal(result.status, 201);
     assert.equal(result.body.account.balance, "1000.00");
+    assert.equal(result.body.transaction.amount, "1500.00");
+    assert.equal(result.body.transaction.balanceAfter, "1000.00");
     assert.equal(database.transactions[0].transaction_type, "WITHDRAWAL");
+    assert.equal(database.transactions[0].amount, "1500.00");
+    assert.equal(database.transactions[0].balance_after, "1000.00");
+  });
+});
+
+test("withdrawal may leave more than the minimum balance", async () => {
+  const database = new FakePool({ balance: "1500.00" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 499.99 });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.account.balance, "1000.01");
+    assert.equal(database.transactions.length, 1);
+    assert.equal(database.transactions[0].balance_after, "1000.01");
   });
 });
 
@@ -697,7 +712,52 @@ test("withdrawal below the minimum balance is rejected", async () => {
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1000 });
     assert.equal(result.status, 422);
+    assert.match(result.body.message, /below ₹1,000\.00/);
     assert.equal(database.account.balance, "1999.99");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("withdrawal that would leave ₹999.99 is rejected without recording a transaction", async () => {
+  const database = new FakePool({ balance: "1500.00" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 500.01 });
+    assert.equal(result.status, 422);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("invalid and non-positive withdrawal amounts are rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    for (const amount of [0, -1, 10.001, "100.00", null]) {
+      const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount });
+      assert.equal(result.status, 400);
+    }
+    const missingAccountNumber = await post(baseUrl, "/withdraw", { amount: 100 });
+    assert.equal(missingAccountNumber.status, 400);
+    const malformedAccountNumber = await post(baseUrl, "/withdraw", { accountNumber: "123", amount: 100 });
+    assert.equal(malformedAccountNumber.status, 400);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("malformed withdrawal JSON is rejected with a client error", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const response = await fetch(`${baseUrl}/transactions/withdraw`, {
+      method: "POST",
+      headers: {
+        Cookie: sessionCookie(loggedIn),
+        "Content-Type": "application/json",
+      },
+      body: "{",
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).message, "Invalid JSON request body");
   });
 });
 
@@ -715,6 +775,10 @@ test("unknown accounts are rejected", async () => {
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: "0000000000", amount: 100 });
     assert.equal(result.status, 404);
+    const withdrawal = await post(baseUrl, "/withdraw", { accountNumber: "0000000000", amount: 100 });
+    assert.equal(withdrawal.status, 404);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
   });
 });
 
@@ -727,12 +791,34 @@ test("inactive accounts cannot transact", async () => {
   });
 });
 
+test("inactive accounts cannot be withdrawn from", async () => {
+  const database = new FakePool({ status: "INACTIVE" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
+    assert.equal(result.status, 409);
+    assert.match(result.body.message, /inactive account/);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
 test("failed record insertion rolls back the balance update", async () => {
   const database = new FakePool({ failInsert: true });
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
     assert.equal(result.status, 500);
     assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("failed withdrawal record insertion rolls back the balance update", async () => {
+  const database = new FakePool({ balance: "2500.00", failInsert: true });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 500 });
+    assert.equal(result.status, 500);
+    assert.match(result.body.message, /could not be completed/i);
+    assert.equal(database.account.balance, "2500.00");
     assert.equal(database.transactions.length, 0);
   });
 });
@@ -758,15 +844,16 @@ test("history returns the stored transaction records", async () => {
 });
 
 test("concurrent withdrawals cannot spend the same balance", async () => {
-  const database = new FakePool({ balance: "3000.00" });
+  const database = new FakePool({ balance: "2500.00" });
   await withApi(database, async (baseUrl) => {
     const results = await Promise.all([
       post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 }),
       post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 }),
     ]);
     assert.deepEqual(results.map((result) => result.status).sort(), [201, 422]);
-    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.account.balance, "1000.00");
     assert.equal(database.transactions.length, 1);
+    assert.equal(database.transactions[0].balance_after, "1000.00");
   });
 });
 

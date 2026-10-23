@@ -43,6 +43,8 @@ Amounts must be positive, have at most two decimal places, and fit the existing 
 
 Successful deposits and withdrawals return a receipt containing `transactionRef`, `createdAt`, `type`, `amount`, and `balanceAfter`. The reference is generated as a UUID, stored with the transaction, and returned only after the balance and transaction record have committed. A detected reference collision is retried a bounded number of times; other database errors roll back the balance change.
 
+Atomicity requires the `accounts` and `transactions` tables to use a transactional storage engine such as InnoDB. The banking table definitions are not included in this repository, so verify their storage engines in each deployed database before relying on rollback behavior.
+
 Reports include deposits, withdrawals, and transaction count for the requested dates, plus current active-account count and balance. Date ranges may span at most 367 calendar days.
 
 ## Endpoints

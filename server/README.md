@@ -31,7 +31,7 @@ Enter the exact existing administrator username, type the displayed `RESET <user
 
 ## Transactions
 
-Banking endpoints require an authenticated session. Accounts and transactions are available to `ADMIN` and `STAFF`; reports and `/api/admin/*` require `ADMIN`.
+Banking endpoints require an authenticated session and an allowed staff role. The only supported roles are `ADMIN` and `STAFF`: both may open, search, view, edit, deactivate, deposit to, withdraw from, and view history for bank accounts; only `ADMIN` may access reports or `/api/admin/*` staff-management operations. Account and transaction routes reject missing or unrecognized roles. No customer login or customer-to-account ownership mapping exists in this application, so customers cannot authenticate to these endpoints and account-level customer self-service/ownership checks are not supported.
 
 - `POST /api/transactions/deposit` with `{ "accountNumber": "7811288401", "amount": 250.50 }`
 - `POST /api/transactions/withdraw` with `{ "accountNumber": "7811288401", "amount": 250.50 }`

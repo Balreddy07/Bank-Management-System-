@@ -1957,6 +1957,65 @@ test("authenticated staff can view, edit, and deactivate customer accounts", asy
   });
 });
 
+test("missing or unsupported roles cannot access banking or administrative routes", async () => {
+  for (const invalidRole of [null, "CUSTOMER", "SUPERADMIN"]) {
+    const user = await makeAuthUser({ role: invalidRole });
+    if (invalidRole === null) user.role = undefined;
+    const database = new FakeAuthPool([user]);
+    await withAuthApi(database, async (baseUrl) => {
+      const loggedIn = await login(baseUrl);
+      assert.equal(loggedIn.status, 200);
+      const headers = {
+        Cookie: sessionCookie(loggedIn),
+        "Content-Type": "application/json",
+      };
+      const requests = [
+        fetch(`${baseUrl}/accounts`, { headers }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, { headers }),
+        fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, { headers }),
+        fetch(`${baseUrl}/transactions/00000000-0000-4000-8000-000000000001`, { headers }),
+        fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, { headers }),
+        fetch(`${baseUrl}/admin/staff`, { headers }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            fullName: "Unauthorized Change",
+            address: "2 New Road",
+            phone: "9876543211",
+          }),
+        }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ confirm: true }),
+        }),
+        fetch(`${baseUrl}/transactions/deposit`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+        }),
+        fetch(`${baseUrl}/transactions/withdraw`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+        }),
+        fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ confirm: true }),
+        }),
+      ];
+      const responses = await Promise.all(requests);
+      assert.ok(responses.every((response) => response.status === 403));
+      assert.equal(database.account.balance, "2500.00");
+      assert.equal(database.account.status, "ACTIVE");
+      assert.equal(database.customer.fullName, "Asha Sharma");
+      assert.equal(database.transactions.length, 0);
+    });
+  }
+});
+
 test("successful login returns a safe user and HTTP-only session cookie", async () => {
   const database = new FakeAuthPool([await makeAuthUser()]);
   await withAuthApi(database, async (baseUrl) => {

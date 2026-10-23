@@ -348,6 +348,7 @@ class FakeAuthPool {
       address: "1 Old Road",
       phone: "9876543210",
     };
+    this.transactions = [];
     this.lockTail = Promise.resolve();
   }
 
@@ -469,6 +470,17 @@ class FakeAuthPool {
   }
 
   async execute(sql, params) {
+    if (sql.includes("SELECT account_number AS accountNumber, balance, status")) {
+      if (params[0] !== this.account.account_number) return [[]];
+      return [[{
+        accountNumber: this.account.account_number,
+        balance: this.account.balance,
+        status: this.account.status,
+      }]];
+    }
+    if (sql.includes("FROM transactions") && sql.includes("account_id = (")) {
+      return [[...this.transactions]];
+    }
     if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
       if (params[0] !== this.account.accountNumber) return [[]];
       return [[{
@@ -665,6 +677,15 @@ test("deposit updates the balance and returns a complete transaction receipt", a
     assert.equal(database.transactions[0].transaction_type, "DEPOSIT");
     assert.equal(database.transactions[0].amount, "500.25");
     assert.equal(database.transactions[0].balance_after, "2000.25");
+
+    const inquiry = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
+    const inquiryResult = await inquiry.json();
+    assert.equal(inquiry.status, 200);
+    assert.deepEqual(inquiryResult.account, {
+      accountNumber: ACCOUNT_NUMBER,
+      balance: "2000.25",
+      status: "ACTIVE",
+    });
   });
 });
 
@@ -711,6 +732,15 @@ test("withdrawal may leave exactly the minimum balance", async () => {
     assert.equal(database.transactions[0].transaction_type, "WITHDRAWAL");
     assert.equal(database.transactions[0].amount, "1500.00");
     assert.equal(database.transactions[0].balance_after, "1000.00");
+
+    const inquiry = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
+    const inquiryResult = await inquiry.json();
+    assert.equal(inquiry.status, 200);
+    assert.deepEqual(inquiryResult.account, {
+      accountNumber: ACCOUNT_NUMBER,
+      balance: "1000.00",
+      status: "ACTIVE",
+    });
   });
 });
 
@@ -1560,6 +1590,43 @@ test("protected endpoints reject unauthenticated requests", async () => {
     assert.equal((await responses[0].json()).code, "AUTH_REQUIRED");
     assert.equal(database.account.status, "ACTIVE");
     assert.equal(database.users[0].failedLoginAttempts, 0);
+  });
+});
+
+test("authenticated staff can inquire about a valid account balance", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    assert.equal(loggedIn.status, 200);
+
+    const response = await fetch(
+      `${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`,
+      { headers: { Cookie: sessionCookie(loggedIn) } }
+    );
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(result.account, {
+      accountNumber: ACCOUNT_NUMBER,
+      balance: "2500.00",
+      status: "ACTIVE",
+    });
+    assert.deepEqual(result.transactions, []);
+
+    const missing = await fetch(
+      `${baseUrl}/transactions?accountNumber=0000000000`,
+      { headers: { Cookie: sessionCookie(loggedIn) } }
+    );
+    assert.equal(missing.status, 404);
+
+    database.account.status = "INACTIVE";
+    const inactive = await fetch(
+      `${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`,
+      { headers: { Cookie: sessionCookie(loggedIn) } }
+    );
+    const inactiveResult = await inactive.json();
+    assert.equal(inactive.status, 200);
+    assert.equal(inactiveResult.account.balance, "2500.00");
+    assert.equal(inactiveResult.account.status, "INACTIVE");
   });
 });
 

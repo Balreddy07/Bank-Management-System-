@@ -20,6 +20,7 @@ class FakePool {
     failDuplicateInsert = false,
     hideTransactionReceipt = false,
     duplicateTransactionRefs = [],
+    duplicateKeyName = "uq_transactions_transaction_ref",
   } = {}) {
     this.account = {
       account_id: 1,
@@ -32,6 +33,7 @@ class FakePool {
     this.failDuplicateInsert = failDuplicateInsert;
     this.hideTransactionReceipt = hideTransactionReceipt;
     this.duplicateTransactionRefs = new Set(duplicateTransactionRefs);
+    this.duplicateKeyName = duplicateKeyName;
     this.lockTail = Promise.resolve();
   }
 
@@ -66,14 +68,16 @@ class FakePool {
         }
 
         if (sql.includes("INSERT INTO transactions")) {
-          if (database.duplicateTransactionRefs.has(params[0])) {
-            const error = new Error("Duplicate entry for key 'uq_transactions_transaction_ref'");
+          if (database.failDuplicateInsert) {
+            const error = new Error("Duplicate entry for key 'uq_other_unique_key'");
             error.code = "ER_DUP_ENTRY";
+            error.sqlMessage = error.message;
             throw error;
           }
-          if (database.failDuplicateInsert) {
-            const error = new Error("Duplicate entry for another transaction key");
+          if (database.duplicateTransactionRefs.has(params[0])) {
+            const error = new Error(`Duplicate entry for key '${database.duplicateKeyName}'`);
             error.code = "ER_DUP_ENTRY";
+            error.sqlMessage = error.message;
             throw error;
           }
           if (database.failInsert) {
@@ -100,6 +104,16 @@ class FakePool {
         ) {
           return [database.duplicateTransactionRefs.has(params[0])
             ? [{ transaction_ref: params[0] }]
+            : []];
+        }
+
+        if (sql.includes("INFORMATION_SCHEMA.STATISTICS")) {
+          return [params[0] === database.duplicateKeyName
+            ? [{
+              indexName: database.duplicateKeyName,
+              columnCount: 1,
+              referenceColumnCount: 1,
+            }]
             : []];
         }
 
@@ -828,12 +842,35 @@ test("transaction-reference collisions are bounded and roll back without a recei
   }
 });
 
+test("duplicate references are rejected by the mocked transaction_ref unique index", async () => {
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const database = new FakePool({
+    duplicateTransactionRefs: [existingReference],
+  });
+  const api = await startApi(database, () => existingReference);
+  try {
+    const result = await post(api.baseUrl, "/deposit", {
+      accountNumber: ACCOUNT_NUMBER,
+      amount: 100,
+    });
+    assert.equal(result.status, 500);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
 test("unrelated duplicate-key errors are not retried as reference collisions", async () => {
-  const database = new FakePool({ failDuplicateInsert: true });
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const database = new FakePool({
+    failDuplicateInsert: true,
+    duplicateTransactionRefs: [existingReference],
+  });
   let generatedCount = 0;
   const api = await startApi(database, () => {
     generatedCount += 1;
-    return "00000000-0000-4000-8000-000000000001";
+    return existingReference;
   });
   try {
     const result = await post(api.baseUrl, "/deposit", {

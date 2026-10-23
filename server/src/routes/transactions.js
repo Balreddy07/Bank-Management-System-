@@ -28,6 +28,12 @@ function readStoredMoneyCents(value) {
   return BigInt(match[1]) * 100n + BigInt((match[2] || "").padEnd(2, "0"));
 }
 
+function getDuplicateKeyName(error) {
+  const message = error.sqlMessage || error.message || "";
+  const match = /\bfor key\s+['"`]([^'"`]+)['"`]\s*$/i.exec(message);
+  return match ? match[1].split(".").pop() : null;
+}
+
 function createTransactionRouter(
   databasePool = pool,
   { transactionReferenceGenerator = randomUUID } = {}
@@ -201,6 +207,30 @@ async function processBalanceChange(
         break;
       } catch (error) {
         if (error.code !== "ER_DUP_ENTRY") throw error;
+
+        const duplicateKeyName = getDuplicateKeyName(error);
+        if (!duplicateKeyName) throw error;
+
+        const [uniqueIndexes] = await connection.execute(
+          `SELECT INDEX_NAME AS indexName,
+                  COUNT(*) AS columnCount,
+                  SUM(COLUMN_NAME = 'transaction_ref') AS referenceColumnCount
+           FROM INFORMATION_SCHEMA.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'transactions'
+             AND INDEX_NAME = ?
+             AND NON_UNIQUE = 0
+           GROUP BY INDEX_NAME`,
+          [duplicateKeyName]
+        );
+        const [referenceIndex] = uniqueIndexes;
+        if (
+          !referenceIndex ||
+          Number(referenceIndex.columnCount) !== 1 ||
+          Number(referenceIndex.referenceColumnCount) !== 1
+        ) {
+          throw error;
+        }
 
         const [existingReferences] = await connection.execute(
           `SELECT transaction_ref

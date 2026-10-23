@@ -9,6 +9,7 @@ async function migrate() {
     path.join(__dirname, "../../migrations/001_create_staff_users.sql"),
     path.join(__dirname, "../../migrations/002_create_transaction_idempotency.sql"),
     path.join(__dirname, "../../migrations/003_create_customer_users.sql"),
+    path.join(__dirname, "../../migrations/004_create_security_audit_logs.sql"),
   ];
   for (const migrationPath of migrationPaths) {
     const migration = await fs.readFile(migrationPath, "utf8");

@@ -1,6 +1,7 @@
 const bcrypt = require("bcrypt");
 const express = require("express");
 const { promisify } = require("node:util");
+const { writeAuditEvent } = require("../audit-logger");
 
 const FAILED_LOGIN_LIMIT = 3;
 const DUMMY_HASH_PROMISE = bcrypt.hash("securebank-invalid-login-dummy", 12);
@@ -24,6 +25,7 @@ function createAuthRouter({
   loginLimiter = (req, res, next) => next(),
   secureCookie = false,
   sameSite = "lax",
+  auditLogger,
 }) {
   const router = express.Router();
 
@@ -32,6 +34,15 @@ function createAuthRouter({
     const password = typeof req.body?.password === "string" ? req.body.password : "";
     if (!/^[a-z0-9._-]{3,64}$/.test(username) || password.length < 1 || Buffer.byteLength(password, "utf8") > 72) {
       if (password.length <= 128) await bcrypt.compare(password || "invalid", await DUMMY_HASH_PROMISE);
+      try {
+        await writeAuditEvent(databasePool, {
+          eventType: "AUTH_LOGIN_FAILURE",
+          outcome: "FAILURE",
+        });
+      } catch (error) {
+        console.error("Login audit write failed:", error.code || "unknown error");
+        return res.status(503).json({ message: "Login is temporarily unavailable. Try again." });
+      }
       return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
     }
 
@@ -66,17 +77,35 @@ function createAuthRouter({
           [username]
         );
         if (!customerRows.length) {
-          await connection.rollback();
-          transactionStarted = false;
           await bcrypt.compare(password, await DUMMY_HASH_PROMISE);
+          await writeAuditEvent(connection, {
+            eventType: "AUTH_LOGIN_FAILURE",
+            outcome: "FAILURE",
+          });
+          await connection.commit();
+          transactionStarted = false;
           return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
         }
 
         const customer = customerRows[0];
         if (Number(customer.lockActive) === 1 || Number(customer.isActive) !== 1) {
-          await connection.rollback();
-          transactionStarted = false;
           await bcrypt.compare(password, customer.passwordHash);
+          await writeAuditEvent(connection, {
+            eventType: "AUTH_LOGIN_FAILURE",
+            outcome: "FAILURE",
+            actorUserId: customer.customerId,
+            actorRole: "CUSTOMER",
+          });
+          if (Number(customer.lockActive) === 1) {
+            await writeAuditEvent(connection, {
+              eventType: "AUTH_ACCOUNT_LOCKED",
+              outcome: "DENIED",
+              actorUserId: customer.customerId,
+              actorRole: "CUSTOMER",
+            });
+          }
+          await connection.commit();
+          transactionStarted = false;
           return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
         }
 
@@ -92,6 +121,20 @@ function createAuthRouter({
              WHERE customer_id = ?`,
             [nextAttempts, nextAttempts, FAILED_LOGIN_LIMIT, customer.customerId]
           );
+          await writeAuditEvent(connection, {
+            eventType: "AUTH_LOGIN_FAILURE",
+            outcome: "FAILURE",
+            actorUserId: customer.customerId,
+            actorRole: "CUSTOMER",
+          });
+          if (nextAttempts >= FAILED_LOGIN_LIMIT) {
+            await writeAuditEvent(connection, {
+              eventType: "AUTH_ACCOUNT_LOCKED",
+              outcome: "DENIED",
+              actorUserId: customer.customerId,
+              actorRole: "CUSTOMER",
+            });
+          }
           await connection.commit();
           transactionStarted = false;
           return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
@@ -101,6 +144,12 @@ function createAuthRouter({
           "UPDATE customer_users SET failed_login_attempts = 0, locked_until = NULL WHERE customer_id = ?",
           [customer.customerId]
         );
+        await writeAuditEvent(connection, {
+          eventType: "AUTH_LOGIN_SUCCESS",
+          outcome: "SUCCESS",
+          actorUserId: customer.customerId,
+          actorRole: "CUSTOMER",
+        });
         await connection.commit();
         transactionStarted = false;
 
@@ -114,9 +163,23 @@ function createAuthRouter({
 
       const user = rows[0];
       if (Number(user.lockActive) === 1 || Number(user.isActive) !== 1) {
-        await connection.rollback();
-        transactionStarted = false;
         await bcrypt.compare(password, user.passwordHash);
+        await writeAuditEvent(connection, {
+          eventType: "AUTH_LOGIN_FAILURE",
+          outcome: "FAILURE",
+          actorUserId: user.userId,
+          actorRole: user.role,
+        });
+        if (Number(user.lockActive) === 1) {
+          await writeAuditEvent(connection, {
+            eventType: "AUTH_ACCOUNT_LOCKED",
+            outcome: "DENIED",
+            actorUserId: user.userId,
+            actorRole: user.role,
+          });
+        }
+        await connection.commit();
+        transactionStarted = false;
         return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
       }
 
@@ -131,6 +194,20 @@ function createAuthRouter({
            WHERE user_id = ?`,
           [nextAttempts, nextAttempts, FAILED_LOGIN_LIMIT, user.userId]
         );
+        await writeAuditEvent(connection, {
+          eventType: "AUTH_LOGIN_FAILURE",
+          outcome: "FAILURE",
+          actorUserId: user.userId,
+          actorRole: user.role,
+        });
+        if (nextAttempts >= FAILED_LOGIN_LIMIT) {
+          await writeAuditEvent(connection, {
+            eventType: "AUTH_ACCOUNT_LOCKED",
+            outcome: "DENIED",
+            actorUserId: user.userId,
+            actorRole: user.role,
+          });
+        }
         await connection.commit();
         transactionStarted = false;
         return res.status(401).json({ message: GENERIC_LOGIN_FAILURE });
@@ -140,6 +217,12 @@ function createAuthRouter({
         "UPDATE staff_users SET failed_login_attempts = 0, locked_until = NULL WHERE user_id = ?",
         [user.userId]
       );
+      await writeAuditEvent(connection, {
+        eventType: "AUTH_LOGIN_SUCCESS",
+        outcome: "SUCCESS",
+        actorUserId: user.userId,
+        actorRole: user.role,
+      });
       await connection.commit();
       transactionStarted = false;
 
@@ -214,8 +297,26 @@ function createAuthRouter({
 
   router.post("/logout", async (req, res) => {
     if (!req.session) return res.status(200).json({ message: "Signed out." });
+    const auditActor = req.session.userId
+      ? {
+        userId: req.session.userId,
+        role: req.session.userType === "CUSTOMER" ? "CUSTOMER" : undefined,
+      }
+      : null;
     try {
       await promisify(req.session.destroy).call(req.session);
+      if (auditActor) {
+        try {
+          await auditLogger?.write({
+            eventType: "AUTH_LOGOUT",
+            outcome: "SUCCESS",
+            actorUserId: auditActor.userId,
+            actorRole: auditActor.role,
+          });
+        } catch (error) {
+          console.error("Logout audit write failed:", error.code || "unknown error");
+        }
+      }
       res.clearCookie("securebank.sid", {
         httpOnly: true,
         sameSite,

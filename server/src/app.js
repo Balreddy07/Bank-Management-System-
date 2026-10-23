@@ -8,6 +8,7 @@ const pool = require("./db");
 const MySQLSessionStore = require("./auth/mysql-session-store");
 const { createAuthRouter } = require("./auth/routes");
 const { createAuthMiddleware, requireRole } = require("./auth/middleware");
+const { createAuditLogger } = require("./audit-logger");
 const { createAccountRouter } = require("./routes/accounts");
 const { createTransactionRouter } = require("./routes/transactions");
 const { createReportRouter } = require("./routes/reports");
@@ -42,6 +43,8 @@ function createApp({
 
   const app = express();
   const secret = sessionSecret || crypto.randomBytes(48).toString("hex");
+  const auditLogger = createAuditLogger(databasePool);
+  app.locals.auditLogger = auditLogger;
 
   app.use(cors({
     origin(origin, callback) {
@@ -101,6 +104,7 @@ function createApp({
     loginLimiter,
     secureCookie,
     sameSite: sameSite.toLowerCase(),
+    auditLogger,
   }));
 
   const { requireAuth } = createAuthMiddleware(databasePool);

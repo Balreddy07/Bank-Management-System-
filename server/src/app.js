@@ -14,6 +14,7 @@ const { createReportRouter } = require("./routes/reports");
 const { createAdminRouter } = require("./routes/admin");
 
 const DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 function createSessionStore(databasePool) {
   return new MySQLSessionStore(databasePool);
@@ -68,7 +69,7 @@ function createApp({
       httpOnly: true,
       secure: secureCookie,
       sameSite: sameSite.toLowerCase(),
-      maxAge: 8 * 60 * 60 * 1000,
+      maxAge: SESSION_IDLE_TIMEOUT_MS,
       path: "/",
     },
   }));

@@ -16,7 +16,13 @@ class MySQLSessionStore extends session.Store {
       "SELECT data FROM user_sessions WHERE session_id = ? AND expires > UNIX_TIMESTAMP()",
       [sessionId]
     ).then(([rows]) => {
-      callback(null, rows.length ? JSON.parse(rows[0].data) : null);
+      if (rows.length) return JSON.parse(rows[0].data);
+      return this.databasePool.execute(
+        "DELETE FROM user_sessions WHERE session_id = ? AND expires <= UNIX_TIMESTAMP()",
+        [sessionId]
+      ).then(() => null);
+    }).then((sessionData) => {
+      callback(null, sessionData);
     }).catch((error) => callback(error));
   }
 
@@ -51,7 +57,7 @@ class MySQLSessionStore extends session.Store {
 function sessionExpirySeconds(sessionData) {
   const expirationMilliseconds = sessionData.cookie?.expires
     ? new Date(sessionData.cookie.expires).getTime()
-    : Date.now() + Number(sessionData.cookie?.maxAge ?? 8 * 60 * 60 * 1000);
+    : Date.now() + Number(sessionData.cookie?.maxAge ?? 30 * 60 * 1000);
   return Math.floor(expirationMilliseconds / 1000);
 }
 

@@ -4,6 +4,7 @@ const pool = require("../db");
 
 const MAX_BALANCE_CENTS = 999999999999n;
 const MIN_WITHDRAWAL_BALANCE_CENTS = 100000n;
+const MAX_TRANSACTION_REFERENCE_ATTEMPTS = 5;
 
 function parseMoneyCents(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -27,14 +28,17 @@ function readStoredMoneyCents(value) {
   return BigInt(match[1]) * 100n + BigInt((match[2] || "").padEnd(2, "0"));
 }
 
-function createTransactionRouter(databasePool = pool) {
+function createTransactionRouter(
+  databasePool = pool,
+  { transactionReferenceGenerator = randomUUID } = {}
+) {
   const router = express.Router();
 
   router.post("/deposit", (req, res) =>
-    processBalanceChange(req, res, "DEPOSIT", databasePool)
+    processBalanceChange(req, res, "DEPOSIT", databasePool, transactionReferenceGenerator)
   );
   router.post("/withdraw", (req, res) =>
-    processBalanceChange(req, res, "WITHDRAWAL", databasePool)
+    processBalanceChange(req, res, "WITHDRAWAL", databasePool, transactionReferenceGenerator)
   );
 
   router.get("/", async (req, res) => {
@@ -111,7 +115,13 @@ function createTransactionRouter(databasePool = pool) {
   return router;
 }
 
-async function processBalanceChange(req, res, transactionType, databasePool) {
+async function processBalanceChange(
+  req,
+  res,
+  transactionType,
+  databasePool,
+  transactionReferenceGenerator
+) {
   const { accountNumber, amount } = req.body || {};
 
   if (typeof accountNumber !== "string" || !/^\d{10}$/.test(accountNumber)) {
@@ -171,18 +181,43 @@ async function processBalanceChange(req, res, transactionType, databasePool) {
 
     const balanceAfter = formatMoneyCents(nextBalanceCents);
     const amountValue = formatMoneyCents(amountCents);
-    const transactionRef = randomUUID();
 
     await connection.execute(
       "UPDATE accounts SET balance = ? WHERE account_id = ?",
       [balanceAfter, account.account_id]
     );
-    await connection.execute(
-      `INSERT INTO transactions
-       (transaction_ref, account_id, transaction_type, amount, balance_after)
-       VALUES (?, ?, ?, ?, ?)`,
-      [transactionRef, account.account_id, transactionType, amountValue, balanceAfter]
-    );
+
+    let transactionRef;
+    for (let attempt = 0; attempt < MAX_TRANSACTION_REFERENCE_ATTEMPTS; attempt += 1) {
+      const candidate = transactionReferenceGenerator();
+      try {
+        await connection.execute(
+          `INSERT INTO transactions
+           (transaction_ref, account_id, transaction_type, amount, balance_after)
+           VALUES (?, ?, ?, ?, ?)`,
+          [candidate, account.account_id, transactionType, amountValue, balanceAfter]
+        );
+        transactionRef = candidate;
+        break;
+      } catch (error) {
+        if (error.code !== "ER_DUP_ENTRY") throw error;
+
+        const [existingReferences] = await connection.execute(
+          `SELECT transaction_ref
+           FROM transactions
+           WHERE transaction_ref = ?
+           FOR UPDATE`,
+          [candidate]
+        );
+        if (existingReferences.length === 0) throw error;
+      }
+    }
+
+    if (!transactionRef) {
+      const error = new Error("Unable to generate a unique transaction reference.");
+      error.code = "TRANSACTION_REFERENCE_RETRY_LIMIT";
+      throw error;
+    }
 
     const [transactionRows] = await connection.execute(
       `SELECT transaction_ref AS transactionRef,

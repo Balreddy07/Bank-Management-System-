@@ -41,6 +41,8 @@ Banking endpoints require an authenticated session. Accounts and transactions ar
 
 Amounts must be positive, have at most two decimal places, and fit the existing database monetary range. Withdrawals preserve a minimum balance of ₹1,000.00. Balance changes and transaction records are committed together.
 
+Successful deposits and withdrawals return a receipt containing `transactionRef`, `createdAt`, `type`, `amount`, and `balanceAfter`. The reference is generated as a UUID, stored with the transaction, and returned only after the balance and transaction record have committed. A detected reference collision is retried a bounded number of times; other database errors roll back the balance change.
+
 Reports include deposits, withdrawals, and transaction count for the requested dates, plus current active-account count and balance. Date ranges may span at most 367 calendar days.
 
 ## Endpoints

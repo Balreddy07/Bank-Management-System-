@@ -1,0 +1,1577 @@
+const assert = require("node:assert/strict");
+const express = require("express");
+const session = require("express-session");
+const { once } = require("node:events");
+const test = require("node:test");
+const bcrypt = require("bcrypt");
+const { createApp } = require("../src/app");
+const MySQLSessionStore = require("../src/auth/mysql-session-store");
+const { createAccountRouter } = require("../src/routes/accounts");
+const { createReportRouter } = require("../src/routes/reports");
+const { createTransactionRouter } = require("../src/routes/transactions");
+
+const ACCOUNT_NUMBER = "7811288401";
+
+class FakePool {
+  constructor({ balance = "1500.00", status = "ACTIVE", failInsert = false } = {}) {
+    this.account = {
+      account_id: 1,
+      account_number: ACCOUNT_NUMBER,
+      balance,
+      status,
+    };
+    this.transactions = [];
+    this.failInsert = failInsert;
+    this.lockTail = Promise.resolve();
+  }
+
+  async acquireLock() {
+    const previous = this.lockTail;
+    let unlock;
+    this.lockTail = new Promise((resolve) => {
+      unlock = resolve;
+    });
+    await previous;
+    return unlock;
+  }
+
+  async getConnection() {
+    const database = this;
+    let unlock;
+    let stagedBalance;
+    let stagedTransaction;
+
+    return {
+      async beginTransaction() {
+        unlock = await database.acquireLock();
+      },
+      async execute(sql, params) {
+        if (sql.includes("FOR UPDATE")) {
+          return [database.account.account_number === params[0] ? [{ ...database.account }] : []];
+        }
+
+        if (sql.startsWith("UPDATE accounts")) {
+          stagedBalance = params[0];
+          return [{ affectedRows: 1 }];
+        }
+
+        if (sql.includes("INSERT INTO transactions")) {
+          if (database.failInsert) {
+            const error = new Error("simulated insert failure");
+            error.code = "TEST_INSERT_FAILURE";
+            throw error;
+          }
+
+          stagedTransaction = {
+            transaction_ref: params[0],
+            account_id: params[1],
+            transaction_type: params[2],
+            amount: params[3],
+            balance_after: params[4],
+            created_at: new Date("2026-01-02T03:04:05.000Z"),
+          };
+          return [{ affectedRows: 1 }];
+        }
+
+        if (sql.includes("WHERE transaction_ref = ?")) {
+          const transaction = stagedTransaction?.transaction_ref === params[0]
+            ? stagedTransaction
+            : database.transactions.find((item) => item.transaction_ref === params[0]);
+          return [transaction ? [database.toApiTransaction(transaction)] : []];
+        }
+
+        throw new Error(`Unexpected connection query: ${sql}`);
+      },
+      async commit() {
+        if (stagedBalance !== undefined) database.account.balance = stagedBalance;
+        if (stagedTransaction) database.transactions.push(stagedTransaction);
+      },
+      async rollback() {
+        stagedBalance = undefined;
+        stagedTransaction = undefined;
+      },
+      release() {
+        unlock?.();
+        unlock = null;
+      },
+    };
+  }
+
+  toApiTransaction(transaction) {
+    return {
+      transactionRef: transaction.transaction_ref,
+      type: transaction.transaction_type,
+      amount: transaction.amount,
+      balanceAfter: transaction.balance_after,
+      createdAt: transaction.created_at,
+    };
+  }
+
+  async execute(sql, params) {
+    if (sql.includes("transactionCount")) {
+      assert.deepEqual(params, ["2026-01-01", "2026-01-31"]);
+      return [[{
+        transactionCount: 4,
+        totalDeposits: "1500.00",
+        totalWithdrawals: "250.00",
+      }]];
+    }
+
+    if (sql.includes("activeAccountCount")) {
+      return [[{ activeAccountCount: 3, totalBalance: "6250.00" }]];
+    }
+
+    if (sql.includes("SELECT account_number AS accountNumber, balance, status")) {
+      if (this.account.account_number !== params[0]) return [[]];
+      return [[{
+        accountNumber: this.account.account_number,
+        balance: this.account.balance,
+        status: this.account.status,
+      }]];
+    }
+
+    if (sql.includes("FROM transactions") && sql.includes("account_id = (")) {
+      return [[...this.transactions]
+        .filter((item) => item.account_id === this.account.account_id)
+        .reverse()
+        .map((item) => this.toApiTransaction(item))];
+    }
+
+    if (sql.includes("FROM transactions t") && sql.includes("transaction_ref = ?")) {
+      const transaction = this.transactions.find((item) => item.transaction_ref === params[0]);
+      return [transaction ? [{
+        ...this.toApiTransaction(transaction),
+        accountNumber: this.account.account_number,
+      }] : []];
+    }
+
+    throw new Error(`Unexpected pool query: ${sql}`);
+  }
+}
+
+class FakeAccountPool {
+  constructor() {
+    this.accounts = [];
+    this.transactions = [];
+    this.committed = false;
+  }
+
+  async execute(sql, params) {
+    if (sql.includes("FROM accounts a")) {
+      this.searchParams = params;
+      const [search, accountPattern, namePattern] = params;
+      assert.equal(accountPattern, `%${search}%`);
+      assert.equal(namePattern, `%${search}%`);
+      const query = search.toLowerCase();
+      return [[...this.accounts].filter((account) =>
+        !query ||
+        account.accountNumber.includes(query) ||
+        account.fullName.toLowerCase().includes(query)
+      )];
+    }
+    throw new Error(`Unexpected account pool query: ${sql}`);
+  }
+
+  async getConnection() {
+    const database = this;
+    let stagedAccount;
+    let stagedTransaction;
+
+    return {
+      async beginTransaction() {},
+      async execute(sql, params) {
+        if (sql.includes("INSERT INTO customers")) return [{ insertId: 12 }];
+        if (sql.includes("INSERT INTO accounts")) {
+          stagedAccount = {
+            accountId: 21,
+            accountNumber: params[0],
+            balance: params[2],
+            status: "ACTIVE",
+            customerId: 12,
+            fullName: "New Test Customer",
+            phone: "9876543210",
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("SELECT account_id FROM accounts")) return [[{ account_id: 21 }]];
+        if (sql.includes("INSERT INTO transactions")) {
+          stagedTransaction = {
+            transactionRef: params[0],
+            accountId: params[1],
+            type: "DEPOSIT",
+            amount: params[2],
+            balanceAfter: params[3],
+          };
+          return [{ affectedRows: 1 }];
+        }
+        throw new Error(`Unexpected account connection query: ${sql}`);
+      },
+      async commit() {
+        database.accounts.push(stagedAccount);
+        database.transactions.push(stagedTransaction);
+        database.committed = true;
+      },
+      async rollback() {
+        stagedAccount = undefined;
+        stagedTransaction = undefined;
+      },
+      release() {},
+    };
+  }
+}
+
+class FakeCustomerAccountPool {
+  constructor({ failCustomerUpdate = false } = {}) {
+    this.account = {
+      accountId: 21,
+      account_id: 21,
+      accountNumber: ACCOUNT_NUMBER,
+      account_number: ACCOUNT_NUMBER,
+      customerId: 12,
+      customer_id: 12,
+      balance: "2500.00",
+      status: "ACTIVE",
+      createdAt: new Date("2026-01-02T03:04:05.000Z"),
+    };
+    this.customer = {
+      customerId: 12,
+      customer_id: 12,
+      fullName: "Asha Sharma",
+      full_name: "Asha Sharma",
+      address: "1 Old Road",
+      phone: "9876543210",
+    };
+    this.transactions = [{ transactionRef: "existing-transaction" }];
+    this.failCustomerUpdate = failCustomerUpdate;
+    this.commitCount = 0;
+    this.rollbackCount = 0;
+  }
+
+  async execute(sql, params) {
+    if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
+      if (params[0] !== this.account.accountNumber) return [[]];
+      return [[{
+        accountId: this.account.accountId,
+        accountNumber: this.account.accountNumber,
+        balance: this.account.balance,
+        status: this.account.status,
+        createdAt: this.account.createdAt,
+        customerId: this.customer.customerId,
+        fullName: this.customer.fullName,
+        address: this.customer.address,
+        phone: this.customer.phone,
+      }]];
+    }
+    throw new Error(`Unexpected customer-account pool query: ${sql}`);
+  }
+
+  async getConnection() {
+    const database = this;
+    let stagedCustomer;
+    let stagedStatus;
+    return {
+      async beginTransaction() {},
+      async execute(sql, params) {
+        if (sql.includes("SELECT account_id, customer_id FROM accounts")) {
+          return [params[0] === database.account.accountNumber
+            ? [{ account_id: database.account.accountId, customer_id: database.account.customerId }]
+            : []];
+        }
+        if (sql.includes("SELECT account_id, status FROM accounts")) {
+          return [params[0] === database.account.accountNumber
+            ? [{ account_id: database.account.accountId, status: database.account.status }]
+            : []];
+        }
+        if (sql.includes("UPDATE customers SET full_name = ?")) {
+          if (database.failCustomerUpdate) {
+            const error = new Error("simulated customer update failure");
+            error.code = "TEST_CUSTOMER_UPDATE_FAILURE";
+            throw error;
+          }
+          stagedCustomer = {
+            ...database.customer,
+            fullName: params[0],
+            full_name: params[0],
+            address: params[1],
+            phone: params[2],
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("UPDATE accounts SET status = 'INACTIVE'")) {
+          stagedStatus = "INACTIVE";
+          return [{ affectedRows: 1 }];
+        }
+        throw new Error(`Unexpected customer-account connection query: ${sql}`);
+      },
+      async commit() {
+        if (stagedCustomer) database.customer = stagedCustomer;
+        if (stagedStatus) database.account.status = stagedStatus;
+        database.commitCount += 1;
+      },
+      async rollback() {
+        stagedCustomer = undefined;
+        stagedStatus = undefined;
+        database.rollbackCount += 1;
+      },
+      release() {},
+    };
+  }
+}
+
+class FakeAuthPool {
+  constructor(users) {
+    this.users = users;
+    this.sessions = new Map();
+    this.account = {
+      account_id: 61,
+      account_number: ACCOUNT_NUMBER,
+      accountId: 61,
+      accountNumber: ACCOUNT_NUMBER,
+      customer_id: 62,
+      customerId: 62,
+      balance: "2500.00",
+      status: "ACTIVE",
+      createdAt: new Date("2026-01-02T03:04:05.000Z"),
+    };
+    this.customer = {
+      customer_id: 62,
+      customerId: 62,
+      full_name: "Asha Sharma",
+      fullName: "Asha Sharma",
+      address: "1 Old Road",
+      phone: "9876543210",
+    };
+    this.lockTail = Promise.resolve();
+  }
+
+  async acquireLock() {
+    const previous = this.lockTail;
+    let unlock;
+    this.lockTail = new Promise((resolve) => {
+      unlock = resolve;
+    });
+    await previous;
+    return unlock;
+  }
+
+  async getConnection() {
+    const database = this;
+    let unlock;
+    let stagedUser;
+    return {
+      async beginTransaction() {
+        unlock = await database.acquireLock();
+      },
+      async execute(sql, params) {
+        if (sql.includes("SELECT data FROM user_sessions WHERE session_id = ? AND expires > UNIX_TIMESTAMP()")) {
+          const stored = database.sessions.get(params[0]);
+          return [[stored && stored.expires > Math.floor(Date.now() / 1000) ? { data: stored.data } : null].filter(Boolean)];
+        }
+        if (sql.includes("WHERE username = ?")) {
+          const user = database.users.find((entry) => entry.username === params[0]);
+          if (!user) return [[]];
+          const lockUntil = user.lockedUntil ? new Date(user.lockedUntil) : null;
+          return [[{
+            userId: user.userId,
+            username: user.username,
+            passwordHash: user.passwordHash,
+            role: user.role,
+            failedLoginAttempts: user.failedLoginAttempts,
+            lockedUntil: lockUntil,
+            isActive: user.isActive,
+            lockActive: lockUntil && lockUntil > new Date() ? 1 : 0,
+            lockExpired: lockUntil && lockUntil <= new Date() ? 1 : 0,
+          }]];
+        }
+        if (sql.includes("SET failed_login_attempts = ?,")) {
+          assert.equal((sql.match(/\?/g) || []).length, params.length);
+          const user = database.users.find((entry) => entry.userId === params[3]);
+          stagedUser = {
+            ...user,
+            failedLoginAttempts: params[0],
+            lockedUntil: params[1] >= params[2]
+              ? new Date(Date.now() + params[3] * 60 * 1000)
+              : null,
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("SET failed_login_attempts = 0")) {
+          const user = database.users.find((entry) => entry.userId === params[0]);
+          stagedUser = { ...user, failedLoginAttempts: 0, lockedUntil: null };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("SELECT user_id AS userId, role, is_active AS isActive")) {
+          const user = database.users.find((entry) => entry.userId === params[0]);
+          return [user ? [{ userId: user.userId, role: user.role, isActive: user.isActive }] : []];
+        }
+        if (sql.includes("SELECT user_id FROM staff_users WHERE role = 'ADMIN'")) {
+          return [[...database.users.filter((entry) => entry.role === "ADMIN" && entry.isActive)
+            .map((entry) => ({ user_id: entry.userId }))]];
+        }
+        if (sql.includes("UPDATE staff_users SET role = ?")) {
+          const user = database.users.find((entry) => entry.userId === params[1]);
+          stagedUser = { ...user, role: params[0] };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("SELECT account_id, status FROM accounts")) {
+          return [[database.account.account_number === params[0]
+            ? { account_id: database.account.account_id, status: database.account.status }
+            : null].filter(Boolean)];
+        }
+        if (sql.includes("SELECT account_id, customer_id FROM accounts")) {
+          return [[database.account.account_number === params[0]
+            ? { account_id: database.account.account_id, customer_id: database.account.customer_id }
+            : null].filter(Boolean)];
+        }
+        if (sql.includes("UPDATE customers SET full_name = ?")) {
+          database.pendingCustomer = {
+            ...database.customer,
+            full_name: params[0],
+            fullName: params[0],
+            address: params[1],
+            phone: params[2],
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("UPDATE accounts SET status = 'INACTIVE'")) {
+          database.pendingAccountStatus = { accountId: params[0], status: "INACTIVE" };
+          return [{ affectedRows: 1 }];
+        }
+        throw new Error(`Unexpected auth connection query: ${sql}`);
+      },
+      async commit() {
+        if (stagedUser) {
+          const index = database.users.findIndex((entry) => entry.userId === stagedUser.userId);
+          database.users[index] = stagedUser;
+        }
+        if (database.pendingAccountStatus) {
+          database.account.status = database.pendingAccountStatus.status;
+          database.pendingAccountStatus = null;
+        }
+        if (database.pendingCustomer) {
+          database.customer = database.pendingCustomer;
+          database.pendingCustomer = null;
+        }
+      },
+      async rollback() {},
+      release() {
+        unlock?.();
+        unlock = null;
+      },
+    };
+  }
+
+  async execute(sql, params) {
+    if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
+      if (params[0] !== this.account.accountNumber) return [[]];
+      return [[{
+        accountId: this.account.accountId,
+        accountNumber: this.account.accountNumber,
+        balance: this.account.balance,
+        status: this.account.status,
+        createdAt: this.account.createdAt,
+        customerId: this.customer.customerId,
+        fullName: this.customer.fullName,
+        address: this.customer.address,
+        phone: this.customer.phone,
+      }]];
+    }
+    if (sql.includes("transactionCount")) {
+      return [[{ transactionCount: 2, totalDeposits: "500.00", totalWithdrawals: "100.00" }]];
+    }
+    if (sql.includes("activeAccountCount")) {
+      return [[{ activeAccountCount: 1, totalBalance: "500.00" }]];
+    }
+    if (sql.includes("SELECT data FROM user_sessions")) {
+      const stored = this.sessions.get(params[0]);
+      return [[stored && stored.expires > Math.floor(Date.now() / 1000) ? { data: stored.data } : null].filter(Boolean)];
+    }
+    if (sql.includes("INSERT INTO user_sessions")) {
+      this.sessions.set(params[0], { expires: Number(params[1]), data: params[2] });
+      return [{ affectedRows: 1 }];
+    }
+    if (sql.includes("UPDATE user_sessions SET expires = ?")) {
+      const stored = this.sessions.get(params[2]);
+      if (stored) {
+        stored.expires = Number(params[0]);
+        stored.data = params[1];
+      }
+      return [{ affectedRows: stored ? 1 : 0 }];
+    }
+    if (sql.includes("DELETE FROM user_sessions WHERE session_id")) {
+      this.sessions.delete(params[0]);
+      return [{ affectedRows: 1 }];
+    }
+    if (sql.includes("DELETE FROM user_sessions WHERE session_id")) {
+      this.sessions.delete(params[0]);
+      return [{ affectedRows: 1 }];
+    }
+    if (sql.includes("DELETE FROM user_sessions WHERE expires <= UNIX_TIMESTAMP()")) {
+      return [{ affectedRows: 0 }];
+    }
+    if (sql.includes("INSERT INTO staff_users")) {
+      const [username, passwordHash, role] = params;
+      const newUser = {
+        userId: Math.max(0, ...this.users.map((user) => user.userId)) + 1,
+        username,
+        passwordHash,
+        role,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        isActive: 1,
+      };
+      this.users.push(newUser);
+      return [{ insertId: newUser.userId }];
+    }
+    if (sql.includes("WHERE user_id = ? AND is_active = 1")) {
+      const user = this.users.find((entry) => entry.userId === Number(params[0]) && entry.isActive);
+      return [user ? [{ userId: user.userId, username: user.username, role: user.role }] : []];
+    }
+    if (sql.includes("FROM staff_users") && sql.includes("ORDER BY username")) {
+      return [[...this.users].map((user) => ({
+        userId: user.userId,
+        username: user.username,
+        role: user.role,
+        isActive: user.isActive,
+        failedLoginAttempts: user.failedLoginAttempts,
+        lockedUntil: user.lockedUntil,
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      }))];
+    }
+    throw new Error(`Unexpected auth pool query: ${sql}`);
+  }
+
+  async query(sql) {
+    if (sql.includes("SELECT 1 AS connected")) return [[{ connected: 1 }]];
+    throw new Error(`Unexpected auth query: ${sql}`);
+  }
+}
+
+async function startApi(database) {
+  const app = express();
+  app.use(express.json());
+  app.use("/api/transactions", createTransactionRouter(database));
+  app.use("/api/reports", createReportRouter(database));
+  const server = app.listen(0);
+  await once(server, "listening");
+  return {
+    baseUrl: `http://127.0.0.1:${server.address().port}/api/transactions`,
+    close: () => new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    }),
+  };
+}
+
+async function withApi(database, run) {
+  const api = await startApi(database);
+  try {
+    await run(api.baseUrl);
+  } finally {
+    await api.close();
+  }
+}
+
+async function withAccountApi(database, run) {
+  const app = express();
+  app.use(express.json());
+  app.use("/api/accounts", createAccountRouter(database));
+  const server = app.listen(0);
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}/api/accounts`;
+  try {
+    await run(baseUrl);
+  } finally {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function withAuthApi(database, run, { persistentSessions = false } = {}) {
+  const sessionStore = persistentSessions
+    ? new MySQLSessionStore(database, { cleanupIntervalMs: 60 * 60 * 1000 })
+    : new session.MemoryStore();
+  const app = createApp({
+    databasePool: database,
+    sessionStore,
+    sessionSecret: "test-session-secret-that-is-at-least-32-characters",
+    secureCookie: false,
+  });
+  const server = app.listen(0);
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}/api`;
+  try {
+    await run(baseUrl);
+  } finally {
+    sessionStore.close?.();
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function makeAuthUser({ role = "STAFF", failedLoginAttempts = 0, lockedUntil = null } = {}) {
+  return {
+    userId: 41,
+    username: "operator.one",
+    passwordHash: await bcrypt.hash("Correct-Horse-Battery-42!", 4),
+    role,
+    failedLoginAttempts,
+    lockedUntil,
+    isActive: 1,
+  };
+}
+
+async function login(baseUrl, username = "operator.one", password = "Correct-Horse-Battery-42!") {
+  return fetch(`${baseUrl}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+function sessionCookie(response) {
+  return response.headers.get("set-cookie")?.split(";")[0];
+}
+
+async function post(baseUrl, path, body) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+test("deposit updates the balance and records a secure reference", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 500.25 });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.account.balance, "2000.25");
+    assert.match(result.body.transaction.transactionRef, /^[0-9a-f-]{36}$/i);
+    assert.equal(database.transactions.length, 1);
+  });
+});
+
+test("zero and negative amounts are rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    for (const amount of [0, -1]) {
+      const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount });
+      assert.equal(result.status, 400);
+    }
+    assert.equal(database.account.balance, "1500.00");
+  });
+});
+
+test("amounts with more than two decimal places are rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 10.001 });
+    assert.equal(result.status, 400);
+    assert.equal(database.account.balance, "1500.00");
+  });
+});
+
+test("amounts beyond the supported monetary range are rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 10000000000 });
+    assert.equal(result.status, 400);
+  });
+});
+
+test("withdrawal may leave exactly the minimum balance", async () => {
+  const database = new FakePool({ balance: "2500.00" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.account.balance, "1000.00");
+    assert.equal(database.transactions[0].transaction_type, "WITHDRAWAL");
+  });
+});
+
+test("withdrawal below the minimum balance is rejected", async () => {
+  const database = new FakePool({ balance: "1999.99" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1000 });
+    assert.equal(result.status, 422);
+    assert.equal(database.account.balance, "1999.99");
+  });
+});
+
+test("withdrawal that would make the balance negative is rejected", async () => {
+  const database = new FakePool({ balance: "1500.00" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 2000 });
+    assert.equal(result.status, 422);
+    assert.equal(database.account.balance, "1500.00");
+  });
+});
+
+test("unknown accounts are rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: "0000000000", amount: 100 });
+    assert.equal(result.status, 404);
+  });
+});
+
+test("inactive accounts cannot transact", async () => {
+  const database = new FakePool({ status: "INACTIVE" });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
+    assert.equal(result.status, 409);
+    assert.equal(database.account.balance, "1500.00");
+  });
+});
+
+test("failed record insertion rolls back the balance update", async () => {
+  const database = new FakePool({ failInsert: true });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
+    assert.equal(result.status, 500);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("history returns the stored transaction records", async () => {
+  const database = new FakePool();
+  database.transactions.push({
+    transaction_ref: "c6b7164e-10fd-46b2-8e6c-3a7fd24025ec",
+    account_id: 1,
+    transaction_type: "DEPOSIT",
+    amount: "500.00",
+    balance_after: "2000.00",
+    created_at: new Date("2026-01-02T03:04:05.000Z"),
+  });
+  await withApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(result.account.balance, "1500.00");
+    assert.equal(result.transactions.length, 1);
+    assert.equal(result.transactions[0].transactionRef, database.transactions[0].transaction_ref);
+  });
+});
+
+test("concurrent withdrawals cannot spend the same balance", async () => {
+  const database = new FakePool({ balance: "3000.00" });
+  await withApi(database, async (baseUrl) => {
+    const results = await Promise.all([
+      post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 }),
+      post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1500 }),
+    ]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [201, 422]);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 1);
+  });
+});
+
+test("reports return database totals for a valid date range", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const response = await fetch(
+      `${baseUrl.replace("/api/transactions", "/api/reports")}?startDate=2026-01-01&endDate=2026-01-31`
+    );
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(result.transactionCount, 4);
+    assert.equal(result.totalDeposits, "1500.00");
+    assert.equal(result.activeAccountCount, 3);
+    assert.equal(result.totalBalance, "6250.00");
+  });
+});
+
+test("reports reject invalid and overlong date ranges", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const reportsUrl = baseUrl.replace("/api/transactions", "/api/reports");
+    const invalid = await fetch(`${reportsUrl}?startDate=2026-02-30&endDate=2026-03-01`);
+    const tooLong = await fetch(`${reportsUrl}?startDate=2025-01-01&endDate=2026-01-03`);
+    assert.equal(invalid.status, 400);
+    assert.equal(tooLong.status, 400);
+  });
+});
+
+test("account opening commits customer, account, and opening deposit atomically", async () => {
+  const database = new FakeAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New Test Customer",
+        address: "1 Test Road",
+        phone: "9876543210",
+        idProofType: "PAN",
+        idProofNumber: "TEST12345",
+        initialDeposit: 500,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 201);
+    assert.match(result.account.accountNumber, /^\d{10}$/);
+    assert.equal(database.committed, true);
+    assert.equal(database.accounts.length, 1);
+    assert.equal(database.transactions.length, 1);
+    assert.equal(result.account.balance, "500.00");
+
+    const searchResponse = await fetch(`${baseUrl}?search=${result.account.accountNumber}`);
+    const searchResult = await searchResponse.json();
+    assert.equal(searchResponse.status, 200);
+    assert.equal(searchResult.accounts.length, 1);
+    assert.equal(searchResult.accounts[0].accountNumber, result.account.accountNumber);
+  });
+});
+
+test("duplicate ID proof registrations are rejected before any account record is created", async () => {
+  class DuplicateIdProofPool extends FakeAccountPool {
+    constructor() {
+      super();
+      this.accountInsertAttempts = 0;
+    }
+
+    async getConnection() {
+      const database = this;
+      let stagedAccount;
+      let stagedTransaction;
+      return {
+        async beginTransaction() {},
+        async execute(sql, params) {
+          if (sql.includes("INSERT INTO customers")) {
+            const error = new Error("Duplicate entry 'TEST12345' for key 'uq_customer_id_proof'");
+            error.code = "ER_DUP_ENTRY";
+            throw error;
+          }
+          if (sql.includes("INSERT INTO accounts")) {
+            database.accountInsertAttempts += 1;
+            stagedAccount = {
+              accountId: 21,
+              accountNumber: params[0],
+              balance: params[2],
+              status: "ACTIVE",
+              customerId: 12,
+              fullName: "New Test Customer",
+              phone: "9876543210",
+            };
+            return [{ affectedRows: 1 }];
+          }
+          if (sql.includes("SELECT account_id FROM accounts")) return [[{ account_id: 21 }]];
+          if (sql.includes("INSERT INTO transactions")) {
+            stagedTransaction = {
+              transactionRef: params[0],
+              accountId: params[1],
+              type: "DEPOSIT",
+              amount: params[2],
+              balanceAfter: params[3],
+            };
+            return [{ affectedRows: 1 }];
+          }
+          throw new Error(`Unexpected duplicate-ID query: ${sql}`);
+        },
+        async commit() {
+          database.accounts.push(stagedAccount);
+          database.transactions.push(stagedTransaction);
+          database.committed = true;
+        },
+        async rollback() {
+          stagedAccount = undefined;
+          stagedTransaction = undefined;
+        },
+        release() {},
+      };
+    }
+  }
+
+  const database = new DuplicateIdProofPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New Test Customer",
+        address: "1 Test Road",
+        phone: "9876543210",
+        idProofType: "PAN",
+        idProofNumber: "TEST12345",
+        initialDeposit: 500,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 409);
+    assert.equal(result.message, "This ID proof is already registered.");
+    assert.equal(database.accountInsertAttempts, 0);
+    assert.equal(database.accounts.length, 0);
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.committed, false);
+  });
+});
+
+test("account opening rolls back the customer and account if the opening deposit insert fails", async () => {
+  class FailingOpeningPool extends FakeAccountPool {
+    async getConnection() {
+      const database = this;
+      let stagedAccount;
+      let stagedTransaction;
+      return {
+        async beginTransaction() {},
+        async execute(sql, params) {
+          if (sql.includes("INSERT INTO customers")) return [{ insertId: 12 }];
+          if (sql.includes("INSERT INTO accounts")) {
+            stagedAccount = {
+              accountId: 21,
+              accountNumber: params[0],
+              balance: params[2],
+              status: "ACTIVE",
+              customerId: 12,
+              fullName: "New Test Customer",
+              phone: "9876543210",
+            };
+            return [{ affectedRows: 1 }];
+          }
+          if (sql.includes("SELECT account_id FROM accounts")) return [[{ account_id: 21 }]];
+          if (sql.includes("INSERT INTO transactions")) {
+            const error = new Error("simulated opening-deposit failure");
+            error.code = "TEST_OPENING_FAILURE";
+            throw error;
+          }
+          throw new Error(`Unexpected failing opening query: ${sql}`);
+        },
+        async commit() {
+          database.accounts.push(stagedAccount);
+          database.transactions.push(stagedTransaction);
+          database.committed = true;
+        },
+        async rollback() {
+          stagedAccount = undefined;
+          stagedTransaction = undefined;
+        },
+        release() {},
+      };
+    }
+  }
+
+  const database = new FailingOpeningPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New Test Customer",
+        address: "1 Test Road",
+        phone: "9876543210",
+        idProofType: "PAN",
+        idProofNumber: "TEST12345",
+        initialDeposit: 500,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 500);
+    assert.equal(result.message, "Account creation failed. Please try again.");
+    assert.equal(database.accounts.length, 0);
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.committed, false);
+  });
+});
+
+test("account number collisions are retried and the final record still matches the required format", async () => {
+  class CollisionAccountPool extends FakeAccountPool {
+    constructor() {
+      super();
+      this.accountInsertAttempts = 0;
+      this.attemptedAccountNumbers = [];
+    }
+
+    async getConnection() {
+      const database = this;
+      let stagedAccount;
+      let stagedTransaction;
+      return {
+        async beginTransaction() {},
+        async execute(sql, params) {
+          if (sql.includes("INSERT INTO customers")) return [{ insertId: 12 }];
+          if (sql.includes("INSERT INTO accounts")) {
+            database.accountInsertAttempts += 1;
+            database.attemptedAccountNumbers.push(params[0]);
+            if (database.accountInsertAttempts === 1) {
+              const error = new Error("Duplicate entry '7811288401' for key 'uq_account_number'");
+              error.code = "ER_DUP_ENTRY";
+              throw error;
+            }
+            stagedAccount = {
+              accountId: 21,
+              accountNumber: params[0],
+              balance: params[2],
+              status: "ACTIVE",
+              customerId: 12,
+              fullName: "New Test Customer",
+              phone: "9876543210",
+            };
+            return [{ affectedRows: 1 }];
+          }
+          if (sql.includes("SELECT account_id FROM accounts")) return [[{ account_id: 21 }]];
+          if (sql.includes("INSERT INTO transactions")) {
+            stagedTransaction = {
+              transactionRef: params[0],
+              accountId: params[1],
+              type: "DEPOSIT",
+              amount: params[2],
+              balanceAfter: params[3],
+            };
+            return [{ affectedRows: 1 }];
+          }
+          throw new Error(`Unexpected collision query: ${sql}`);
+        },
+        async commit() {
+          database.accounts.push(stagedAccount);
+          database.transactions.push(stagedTransaction);
+          database.committed = true;
+        },
+        async rollback() {
+          stagedAccount = undefined;
+          stagedTransaction = undefined;
+        },
+        release() {},
+      };
+    }
+  }
+
+  const database = new CollisionAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New Test Customer",
+        address: "1 Test Road",
+        phone: "9876543210",
+        idProofType: "PAN",
+        idProofNumber: "TEST12345",
+        initialDeposit: 500,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 201);
+    assert.match(result.account.accountNumber, /^\d{10}$/);
+    assert.equal(database.accountInsertAttempts, 2);
+    assert.equal(database.attemptedAccountNumbers.length, 2);
+    assert.ok(database.attemptedAccountNumbers.every((number) => /^\d{10}$/.test(number)));
+    assert.equal(database.accounts.length, 1);
+    assert.equal(database.transactions.length, 1);
+    assert.equal(database.committed, true);
+  });
+});
+
+test("account-number retry limit rolls back the opening transaction after five collisions", async () => {
+  class RepeatedCollisionPool extends FakeAccountPool {
+    constructor() {
+      super();
+      this.customers = [];
+      this.accountInsertAttempts = 0;
+      this.rollbackCount = 0;
+    }
+
+    async getConnection() {
+      const database = this;
+      let stagedCustomer;
+      let stagedAccount;
+      let stagedTransaction;
+      return {
+        async beginTransaction() {},
+        async execute(sql) {
+          if (sql.includes("INSERT INTO customers")) {
+            stagedCustomer = { customerId: 12 };
+            return [{ insertId: 12 }];
+          }
+          if (sql.includes("INSERT INTO accounts")) {
+            database.accountInsertAttempts += 1;
+            const error = new Error("Duplicate entry for key 'uq_account_number'");
+            error.code = "ER_DUP_ENTRY";
+            throw error;
+          }
+          if (sql.includes("SELECT account_id FROM accounts")) return [[{ account_id: 21 }]];
+          if (sql.includes("INSERT INTO transactions")) {
+            stagedTransaction = { transactionRef: "unexpected" };
+            return [{ affectedRows: 1 }];
+          }
+          throw new Error(`Unexpected retry-limit query: ${sql}`);
+        },
+        async commit() {
+          database.customers.push(stagedCustomer);
+          database.accounts.push(stagedAccount);
+          database.transactions.push(stagedTransaction);
+          database.committed = true;
+        },
+        async rollback() {
+          database.rollbackCount += 1;
+          stagedCustomer = undefined;
+          stagedAccount = undefined;
+          stagedTransaction = undefined;
+        },
+        release() {},
+      };
+    }
+  }
+
+  const database = new RepeatedCollisionPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "New Test Customer",
+        address: "1 Test Road",
+        phone: "9876543210",
+        idProofType: "PAN",
+        idProofNumber: "TEST12345",
+        initialDeposit: 500,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(result.message, "Could not generate an account number. Please retry.");
+    assert.equal(database.accountInsertAttempts, 5);
+    assert.equal(database.rollbackCount, 1);
+    assert.equal(database.customers.length, 0);
+    assert.equal(database.accounts.length, 0);
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.committed, false);
+  });
+});
+
+test("account directory searches by account number or customer name", async () => {
+  const database = new FakeAccountPool();
+  database.accounts = [
+    { accountId: 1, accountNumber: "7811288401", fullName: "Asha Sharma" },
+    { accountId: 2, accountNumber: "7811288402", fullName: "Ravi Kumar" },
+  ];
+
+  await withAccountApi(database, async (baseUrl) => {
+    const accountSearch = await fetch(`${baseUrl}?search=88401`);
+    assert.equal(accountSearch.status, 200);
+    assert.deepEqual(
+      (await accountSearch.json()).accounts.map((account) => account.accountNumber),
+      ["7811288401"]
+    );
+
+    const nameSearch = await fetch(`${baseUrl}?search=asha`);
+    assert.equal(nameSearch.status, 200);
+    assert.deepEqual(
+      (await nameSearch.json()).accounts.map((account) => account.fullName),
+      ["Asha Sharma"]
+    );
+
+    const tooLongSearch = await fetch(`${baseUrl}?search=${"a".repeat(101)}`);
+    assert.equal(tooLongSearch.status, 400);
+    assert.match((await tooLongSearch.json()).message, /100 characters or fewer/);
+  });
+});
+
+test("account details return customer and account fields and missing accounts return 404", async () => {
+  const database = new FakeCustomerAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`);
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(result.account, {
+      accountId: 21,
+      accountNumber: ACCOUNT_NUMBER,
+      balance: "2500.00",
+      status: "ACTIVE",
+      createdAt: database.account.createdAt.toISOString(),
+      customerId: 12,
+      fullName: "Asha Sharma",
+      address: "1 Old Road",
+      phone: "9876543210",
+    });
+
+    const missing = await fetch(`${baseUrl}/0000000000`);
+    assert.equal(missing.status, 404);
+    assert.equal((await missing.json()).message, "Account not found.");
+  });
+});
+
+test("customer detail updates persist supported fields without changing account identifiers", async () => {
+  const database = new FakeCustomerAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fullName: "Asha Patel",
+        address: "2 New Road",
+        phone: "+91 (987) 654-3210",
+        accountNumber: "0000000000",
+        customerId: 999,
+      }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(result.account, {
+      accountNumber: ACCOUNT_NUMBER,
+      customerId: 12,
+      fullName: "Asha Patel",
+      address: "2 New Road",
+      phone: "+919876543210",
+    });
+    assert.equal(database.customer.fullName, "Asha Patel");
+    assert.equal(database.customer.address, "2 New Road");
+    assert.equal(database.customer.phone, "+919876543210");
+    assert.equal(database.account.accountNumber, ACCOUNT_NUMBER);
+    assert.equal(database.account.customerId, 12);
+    assert.equal(database.commitCount, 1);
+
+    const refreshed = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`);
+    const refreshedResult = await refreshed.json();
+    assert.equal(refreshedResult.account.fullName, "Asha Patel");
+    assert.equal(refreshedResult.account.address, "2 New Road");
+    assert.equal(refreshedResult.account.phone, "+919876543210");
+  });
+});
+
+test("customer detail updates reject invalid fields and missing accounts without committing", async () => {
+  const database = new FakeCustomerAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const invalidBodies = [
+      { fullName: "", address: "New Road", phone: "9876543210" },
+      { fullName: "Asha", address: "New Road", phone: "not-a-phone" },
+      { fullName: "Asha", address: "New Road", phone: "+123456789012345" },
+      { fullName: "A".repeat(101), address: "New Road", phone: "9876543210" },
+    ];
+    for (const body of invalidBodies) {
+      const response = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400);
+    }
+
+    const missing = await fetch(`${baseUrl}/0000000000`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fullName: "Asha", address: "New Road", phone: "9876543210" }),
+    });
+    assert.equal(missing.status, 404);
+    assert.equal(database.customer.fullName, "Asha Sharma");
+    assert.equal(database.customer.address, "1 Old Road");
+    assert.equal(database.commitCount, 0);
+  });
+});
+
+test("failed customer detail updates roll back without partial changes", async () => {
+  const database = new FakeCustomerAccountPool({ failCustomerUpdate: true });
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fullName: "Changed Name", address: "Changed Road", phone: "9876543211" }),
+    });
+    assert.equal(response.status, 500);
+    assert.equal(database.customer.fullName, "Asha Sharma");
+    assert.equal(database.customer.address, "1 Old Road");
+    assert.equal(database.customer.phone, "9876543210");
+    assert.equal(database.commitCount, 0);
+    assert.equal(database.rollbackCount, 1);
+  });
+});
+
+test("account deactivation preserves customer and history and rejects repeats or missing accounts", async () => {
+  const database = new FakeCustomerAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const deactivate = (accountNumber) => fetch(`${baseUrl}/${accountNumber}/deactivate`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    const response = await deactivate(ACCOUNT_NUMBER);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, "INACTIVE");
+    assert.equal(database.account.status, "INACTIVE");
+    assert.equal(database.customer.fullName, "Asha Sharma");
+    assert.equal(database.transactions.length, 1);
+
+    const repeated = await deactivate(ACCOUNT_NUMBER);
+    assert.equal(repeated.status, 409);
+    const missing = await deactivate("0000000000");
+    assert.equal(missing.status, 404);
+    assert.equal(database.commitCount, 1);
+  });
+});
+
+test("inactive accounts retain accessible transaction history", async () => {
+  const database = new FakePool({ status: "INACTIVE" });
+  database.transactions.push({
+    transaction_ref: "c6b7164e-10fd-46b2-8e6c-3a7fd24025ec",
+    account_id: 1,
+    transaction_type: "DEPOSIT",
+    amount: "500.00",
+    balance_after: "2000.00",
+    created_at: new Date("2026-01-02T03:04:05.000Z"),
+  });
+  await withApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(result.account.status, "INACTIVE");
+    assert.equal(result.transactions.length, 1);
+  });
+});
+
+test("authenticated staff can view, edit, and deactivate customer accounts", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const headers = { Cookie: sessionCookie(loggedIn), "Content-Type": "application/json" };
+
+    const viewed = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, { headers });
+    assert.equal(viewed.status, 200);
+    assert.equal((await viewed.json()).account.fullName, "Asha Sharma");
+
+    const edited = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ fullName: "Asha Patel", address: "2 New Road", phone: "9876543211" }),
+    });
+    assert.equal(edited.status, 200);
+    assert.equal(database.customer.full_name, "Asha Patel");
+
+    const deactivated = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(deactivated.status, 200);
+    assert.equal(database.account.status, "INACTIVE");
+  });
+});
+
+test("successful login returns a safe user and HTTP-only session cookie", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/auth/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: "securebank.sid=attacker-controlled-session-id",
+      },
+      body: JSON.stringify({ username: "operator.one", password: "Correct-Horse-Battery-42!" }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(result.user, { userId: 41, username: "operator.one", role: "STAFF" });
+    assert.match(response.headers.get("set-cookie"), /HttpOnly/i);
+    assert.notEqual(sessionCookie(response).split("=")[1], "attacker-controlled-session-id");
+    assert.equal(JSON.stringify(result).includes("passwordHash"), false);
+  });
+});
+
+test("invalid credentials use the same response for unknown usernames", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const wrongPassword = await login(baseUrl, "operator.one", "wrong-password");
+    const unknownUser = await login(baseUrl, "unknown.user", "wrong-password");
+    assert.equal(wrongPassword.status, 401);
+    assert.equal(unknownUser.status, 401);
+    assert.deepEqual(await wrongPassword.json(), await unknownUser.json());
+  });
+});
+
+test("three failed logins lock the user and requests are rejected during the lock", async () => {
+  const user = await makeAuthUser();
+  const database = new FakeAuthPool([user]);
+  await withAuthApi(database, async (baseUrl) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await login(baseUrl, user.username, "wrong-password");
+      assert.equal(response.status, 401);
+    }
+    assert.equal(database.users[0].failedLoginAttempts, 3);
+    assert.ok(database.users[0].lockedUntil > new Date());
+    const correctDuringLock = await login(baseUrl);
+    assert.equal(correctDuringLock.status, 401);
+  });
+});
+
+test("successful login resets prior failures and an expired lock", async () => {
+  const user = await makeAuthUser({
+    failedLoginAttempts: 2,
+    lockedUntil: new Date(Date.now() - 60_000),
+  });
+  const database = new FakeAuthPool([user]);
+  await withAuthApi(database, async (baseUrl) => {
+    const response = await login(baseUrl);
+    assert.equal(response.status, 200);
+    assert.equal(database.users[0].failedLoginAttempts, 0);
+    assert.equal(database.users[0].lockedUntil, null);
+  });
+});
+
+test("protected endpoints reject unauthenticated requests", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const requests = [
+      fetch(`${baseUrl}/accounts`),
+      fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`),
+      fetch(`${baseUrl}/accounts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullName: "Asha", address: "New Road", phone: "9876543210" }),
+      }),
+      fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      }),
+      fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`),
+      fetch(`${baseUrl}/transactions/deposit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+      }),
+      fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`),
+      fetch(`${baseUrl}/admin/staff`),
+    ];
+    const responses = await Promise.all(requests);
+    assert.deepEqual(responses.map((response) => response.status), [401, 401, 401, 401, 401, 401, 401, 401, 401]);
+    assert.equal((await responses[0].json()).code, "AUTH_REQUIRED");
+    assert.equal(database.account.status, "ACTIVE");
+    assert.equal(database.users[0].failedLoginAttempts, 0);
+  });
+});
+
+test("staff cannot access admin endpoints while admins can", async () => {
+  const staffDatabase = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(staffDatabase, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const response = await fetch(`${baseUrl}/admin/staff`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(response.status, 403);
+    const reports = await fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(reports.status, 403);
+  });
+
+  const adminDatabase = new FakeAuthPool([await makeAuthUser({ role: "ADMIN" })]);
+  await withAuthApi(adminDatabase, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const response = await fetch(`${baseUrl}/admin/staff`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).staff.length, 1);
+    const reports = await fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(reports.status, 200);
+  });
+});
+
+test("logout destroys the session and prevents later access", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const cookie = sessionCookie(loggedIn);
+    const logout = await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { Cookie: cookie },
+    });
+    assert.equal(logout.status, 200);
+    const protectedResponse = await fetch(`${baseUrl}/accounts`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(protectedResponse.status, 401);
+  });
+});
+
+test("MySQL session store persists, reads, touches, and destroys sessions", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const cookie = sessionCookie(loggedIn);
+    assert.equal(database.sessions.size, 1);
+    assert.ok(Number.isInteger([...database.sessions.values()][0].expires));
+    assert.match([...database.sessions.values()][0].data, /"userId":41/);
+    const checked = await fetch(`${baseUrl}/auth/session`, { headers: { Cookie: cookie } });
+    assert.equal(checked.status, 200);
+    assert.equal((await checked.json()).user.username, "operator.one");
+    const logout = await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { Cookie: cookie },
+    });
+    assert.equal(logout.status, 200);
+    assert.equal(database.sessions.size, 0);
+  }, { persistentSessions: true });
+});
+
+test("admin can create staff, change another user's role, and deactivate an account", async () => {
+  const admin = await makeAuthUser({ role: "ADMIN" });
+  const staff = { ...await makeAuthUser(), userId: 42, username: "staff.member" };
+  const database = new FakeAuthPool([admin, staff]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const cookie = sessionCookie(loggedIn);
+    const headers = { Cookie: cookie, "Content-Type": "application/json" };
+
+    const created = await fetch(`${baseUrl}/admin/staff`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ username: "new.staff", password: "Long-Unique-Password-123", role: "STAFF" }),
+    });
+    assert.equal(created.status, 201);
+    assert.notEqual(database.users[2].passwordHash, "Long-Unique-Password-123");
+    assert.equal(await bcrypt.compare("Long-Unique-Password-123", database.users[2].passwordHash), true);
+
+    const changedRole = await fetch(`${baseUrl}/admin/staff/42/role`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ role: "ADMIN" }),
+    });
+    assert.equal(changedRole.status, 200);
+    assert.equal(database.users[1].role, "ADMIN");
+
+    const deactivated = await fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(deactivated.status, 200);
+    assert.equal(database.account.status, "INACTIVE");
+  });
+});
+
+test("session check reports a stale session cookie explicitly", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/auth/session`, {
+      headers: { Cookie: "securebank.sid=invalid-session-signature" },
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(result.user, null);
+    assert.equal(result.sessionExpired, true);
+  });
+});
+
+test("admin staff creation rejects passwords exceeding bcrypt's byte limit", async () => {
+  const database = new FakeAuthPool([await makeAuthUser({ role: "ADMIN" })]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const response = await fetch(`${baseUrl}/admin/staff`, {
+      method: "POST",
+      headers: { Cookie: sessionCookie(loggedIn), "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "long.pass", password: "a".repeat(73), role: "STAFF" }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal(database.users.length, 1);
+  });
+});

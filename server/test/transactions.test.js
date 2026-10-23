@@ -436,7 +436,7 @@ class FakeAuthPool {
             ...user,
             failedLoginAttempts: params[0],
             lockedUntil: params[1] >= params[2]
-              ? new Date(Date.now() + params[3] * 60 * 1000)
+              ? new Date(Date.now() + 15 * 60 * 1000)
               : null,
           };
           return [{ affectedRows: 1 }];
@@ -1668,6 +1668,39 @@ test("invalid credentials use the same response for unknown usernames", async ()
   });
 });
 
+test("malformed login credentials are rejected with the generic response", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const responses = await Promise.all([
+      fetch(`${baseUrl}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      fetch(`${baseUrl}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: 123, password: "wrong-password" }),
+      }),
+      fetch(`${baseUrl}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "x", password: "wrong-password" }),
+      }),
+      fetch(`${baseUrl}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "operator.one", password: "a".repeat(73) }),
+      }),
+    ]);
+    const bodies = await Promise.all(responses.map((response) => response.json()));
+    assert.deepEqual(responses.map((response) => response.status), [401, 401, 401, 401]);
+    assert.ok(bodies.every((body) => body.message === bodies[0].message));
+    assert.equal(database.users[0].failedLoginAttempts, 0);
+    assert.equal(database.sessions.size, 0);
+  });
+});
+
 test("three failed logins lock the user and requests are rejected during the lock", async () => {
   const user = await makeAuthUser();
   const database = new FakeAuthPool([user]);
@@ -1675,14 +1708,31 @@ test("three failed logins lock the user and requests are rejected during the loc
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const response = await login(baseUrl, user.username, "wrong-password");
       assert.equal(response.status, 401);
+      assert.equal(database.users[0].failedLoginAttempts, attempt + 1);
     }
     assert.equal(database.users[0].failedLoginAttempts, 3);
-    assert.ok(database.users[0].lockedUntil > new Date());
+    const lockDuration = database.users[0].lockedUntil.getTime() - Date.now();
+    assert.ok(lockDuration > 14 * 60 * 1000);
+    assert.ok(lockDuration <= 15 * 60 * 1000);
     const correctDuringLock = await login(baseUrl);
     assert.equal(correctDuringLock.status, 401);
   });
 });
 
+test("concurrent failed logins cannot bypass the three-attempt lock", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const responses = await Promise.all(
+      Array.from({ length: 6 }, () => login(baseUrl, "operator.one", "wrong-password"))
+    );
+    assert.ok(responses.every((response) => response.status === 401));
+    assert.equal(database.users[0].failedLoginAttempts, 3);
+    const lockDuration = database.users[0].lockedUntil.getTime() - Date.now();
+    assert.ok(lockDuration > 14 * 60 * 1000);
+    assert.ok(lockDuration <= 15 * 60 * 1000);
+    assert.equal(database.sessions.size, 0);
+  });
+});
 test("successful login resets prior failures and an expired lock", async () => {
   const user = await makeAuthUser({
     failedLoginAttempts: 2,

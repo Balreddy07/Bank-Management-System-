@@ -7,6 +7,30 @@ const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,64}$/;
 function createAdminRouter({ databasePool }) {
   const router = express.Router();
 
+  router.get("/audit-logs", async (req, res) => {
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      return res.status(400).json({ message: "Audit log limit must be an integer from 1 to 100." });
+    }
+
+    try {
+      const [auditLogs] = await databasePool.execute(
+        `SELECT audit_id AS auditId, event_type AS eventType, outcome,
+                actor_user_id AS actorUserId, actor_role AS actorRole,
+                target_type AS targetType, target_id AS targetId, created_at AS createdAt
+         FROM security_audit_logs
+         ORDER BY created_at DESC, audit_id DESC
+         LIMIT ?`,
+        [limit]
+      );
+      return res.status(200).json({ auditLogs });
+    } catch (error) {
+      console.error("Audit log retrieval failed:", error.code || "unknown error");
+      return res.status(500).json({ message: "Unable to retrieve audit logs." });
+    }
+  });
+
   router.get("/staff", async (req, res) => {
     try {
       const [staff] = await databasePool.execute(

@@ -43,8 +43,20 @@ function createAuthMiddleware(databasePool) {
 }
 
 function requireRole(...roles) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (!req.user || !roles.includes(req.user.role)) {
+      try {
+        await req.app.locals.auditLogger?.write({
+          eventType: "AUTHORIZATION_DENIED",
+          outcome: "DENIED",
+          actorUserId: req.user?.userId ?? null,
+          actorRole: req.user?.role ?? null,
+          targetType: "endpoint",
+          targetId: `${req.method} ${req.baseUrl || ""}`,
+        });
+      } catch (error) {
+        console.error("Authorization audit write failed:", error.code || "unknown error");
+      }
       return res.status(403).json({ message: "You do not have permission to perform this action." });
     }
     return next();

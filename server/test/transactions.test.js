@@ -341,7 +341,7 @@ class FakeAccountPool {
 }
 
 class FakeCustomerAccountPool {
-  constructor({ failCustomerUpdate = false } = {}) {
+  constructor({ failCustomerUpdate = false, failAuditWrite = false } = {}) {
     this.account = {
       accountId: 21,
       account_id: 21,
@@ -363,11 +363,30 @@ class FakeCustomerAccountPool {
     };
     this.transactions = [{ transactionRef: "existing-transaction" }];
     this.failCustomerUpdate = failCustomerUpdate;
+    this.failAuditWrite = failAuditWrite;
+    this.auditEvents = [];
     this.commitCount = 0;
     this.rollbackCount = 0;
   }
 
   async execute(sql, params) {
+    if (sql.includes("INSERT INTO security_audit_logs")) {
+      if (this.failAuditWrite) {
+        const error = new Error("simulated audit write failure");
+        error.code = "TEST_AUDIT_FAILURE";
+        throw error;
+      }
+      this.auditEvents.push({
+        eventType: params[0],
+        outcome: params[1],
+        actorUserId: params[2],
+        actorRole: params[3],
+        targetType: params[4],
+        targetId: params[5],
+        createdAt: new Date(),
+      });
+      return [{ affectedRows: 1 }];
+    }
     if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
       if (params[0] !== this.account.accountNumber) return [[]];
       return [[{
@@ -389,9 +408,27 @@ class FakeCustomerAccountPool {
     const database = this;
     let stagedCustomer;
     let stagedStatus;
+    const stagedAuditEvents = [];
     return {
       async beginTransaction() {},
       async execute(sql, params) {
+        if (sql.includes("INSERT INTO security_audit_logs")) {
+          if (database.failAuditWrite) {
+            const error = new Error("simulated audit write failure");
+            error.code = "TEST_AUDIT_FAILURE";
+            throw error;
+          }
+          stagedAuditEvents.push({
+            eventType: params[0],
+            outcome: params[1],
+            actorUserId: params[2],
+            actorRole: params[3],
+            targetType: params[4],
+            targetId: params[5],
+            createdAt: new Date(),
+          });
+          return [{ affectedRows: 1 }];
+        }
         if (sql.includes("SELECT account_id, customer_id FROM accounts")) {
           return [params[0] === database.account.accountNumber
             ? [{ account_id: database.account.accountId, customer_id: database.account.customerId }]
@@ -426,11 +463,13 @@ class FakeCustomerAccountPool {
       async commit() {
         if (stagedCustomer) database.customer = stagedCustomer;
         if (stagedStatus) database.account.status = stagedStatus;
+        database.auditEvents.push(...stagedAuditEvents);
         database.commitCount += 1;
       },
       async rollback() {
         stagedCustomer = undefined;
         stagedStatus = undefined;
+        stagedAuditEvents.length = 0;
         database.rollbackCount += 1;
       },
       release() {},
@@ -444,6 +483,8 @@ class FakeAuthPool {
     this.customerUsers = [];
     this.sessions = new Map();
     this.failSessionRead = false;
+    this.failAuditWrite = false;
+    this.auditEvents = [];
     this.account = {
       account_id: 61,
       account_number: ACCOUNT_NUMBER,
@@ -497,11 +538,29 @@ class FakeAuthPool {
     let unlock;
     let stagedUser;
     let stagedCustomerUser;
+    const stagedAuditEvents = [];
     return {
       async beginTransaction() {
         unlock = await database.acquireLock();
       },
       async execute(sql, params) {
+        if (sql.includes("INSERT INTO security_audit_logs")) {
+          if (database.failAuditWrite) {
+            const error = new Error("simulated audit write failure");
+            error.code = "TEST_AUDIT_FAILURE";
+            throw error;
+          }
+          stagedAuditEvents.push({
+            eventType: params[0],
+            outcome: params[1],
+            actorUserId: params[2],
+            actorRole: params[3],
+            targetType: params[4],
+            targetId: params[5],
+            createdAt: new Date(),
+          });
+          return [{ affectedRows: 1 }];
+        }
         if (sql.includes("SELECT data FROM user_sessions WHERE session_id = ? AND expires > UNIX_TIMESTAMP()")) {
           const stored = database.sessions.get(params[0]);
           return [[stored && stored.expires > Math.floor(Date.now() / 1000) ? { data: stored.data } : null].filter(Boolean)];
@@ -628,6 +687,7 @@ class FakeAuthPool {
           database.customer = database.pendingCustomer;
           database.pendingCustomer = null;
         }
+        database.auditEvents.push(...stagedAuditEvents);
       },
       async rollback() {},
       release() {
@@ -638,6 +698,26 @@ class FakeAuthPool {
   }
 
   async execute(sql, params) {
+    if (sql.includes("INSERT INTO security_audit_logs")) {
+      if (this.failAuditWrite) {
+        const error = new Error("simulated audit write failure");
+        error.code = "TEST_AUDIT_FAILURE";
+        throw error;
+      }
+      this.auditEvents.push({
+        eventType: params[0],
+        outcome: params[1],
+        actorUserId: params[2],
+        actorRole: params[3],
+        targetType: params[4],
+        targetId: params[5],
+        createdAt: new Date(),
+      });
+      return [{ affectedRows: 1 }];
+    }
+    if (sql.includes("FROM security_audit_logs")) {
+      return [[...this.auditEvents].reverse().slice(0, params[0])];
+    }
     if (sql.includes("SELECT customer_id AS customerId, username") && sql.includes("FROM customer_users")) {
       const customerUser = this.customerUsers.find(
         (entry) => entry.customerId === Number(params[0]) && entry.isActive
@@ -2021,6 +2101,21 @@ test("customer detail updates persist supported fields without changing account 
     assert.equal(database.account.accountNumber, ACCOUNT_NUMBER);
     assert.equal(database.account.customerId, 12);
     assert.equal(database.commitCount, 1);
+    assert.deepEqual(database.auditEvents.map((event) => ({
+      eventType: event.eventType,
+      outcome: event.outcome,
+      actorUserId: event.actorUserId,
+      actorRole: event.actorRole,
+      targetType: event.targetType,
+      targetId: event.targetId,
+    })), [{
+      eventType: "ACCOUNT_EDIT_SUCCESS",
+      outcome: "SUCCESS",
+      actorUserId: 41,
+      actorRole: "ADMIN",
+      targetType: "account",
+      targetId: ACCOUNT_NUMBER,
+    }]);
 
     const refreshed = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`);
     const refreshedResult = await refreshed.json();
@@ -2077,6 +2172,22 @@ test("failed customer detail updates roll back without partial changes", async (
   });
 });
 
+test("account edits roll back when their audit event cannot be persisted", async () => {
+  const database = new FakeCustomerAccountPool({ failAuditWrite: true });
+  await withAccountApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fullName: "Changed Name", address: "Changed Road", phone: "9876543211" }),
+    });
+    assert.equal(response.status, 500);
+    assert.equal(database.customer.fullName, "Asha Sharma");
+    assert.equal(database.commitCount, 0);
+    assert.equal(database.rollbackCount, 1);
+    assert.deepEqual(database.auditEvents, []);
+  });
+});
+
 test("account deactivation preserves customer and history and rejects repeats or missing accounts", async () => {
   const database = new FakeCustomerAccountPool();
   await withAccountApi(database, async (baseUrl) => {
@@ -2091,6 +2202,21 @@ test("account deactivation preserves customer and history and rejects repeats or
     assert.equal(database.account.status, "INACTIVE");
     assert.equal(database.customer.fullName, "Asha Sharma");
     assert.equal(database.transactions.length, 1);
+    assert.deepEqual(database.auditEvents.map((event) => ({
+      eventType: event.eventType,
+      outcome: event.outcome,
+      actorUserId: event.actorUserId,
+      actorRole: event.actorRole,
+      targetType: event.targetType,
+      targetId: event.targetId,
+    })), [{
+      eventType: "ACCOUNT_DEACTIVATION_SUCCESS",
+      outcome: "SUCCESS",
+      actorUserId: 41,
+      actorRole: "ADMIN",
+      targetType: "account",
+      targetId: ACCOUNT_NUMBER,
+    }]);
 
     const repeated = await deactivate(ACCOUNT_NUMBER);
     assert.equal(repeated.status, 409);
@@ -2430,6 +2556,14 @@ test("successful login returns a safe user and HTTP-only session cookie", async 
     assert.notEqual(sessionCookie(response).split("=")[1], "attacker-controlled-session-id");
     assert.equal(JSON.stringify(result).includes("passwordHash"), false);
     assert.equal(JSON.stringify(result).includes(sessionCookie(response).split("=")[1]), false);
+    assert.equal(database.auditEvents.length, 1);
+    assert.equal(database.auditEvents[0].eventType, "AUTH_LOGIN_SUCCESS");
+    assert.equal(database.auditEvents[0].outcome, "SUCCESS");
+    assert.equal(database.auditEvents[0].actorUserId, 41);
+    assert.equal(database.auditEvents[0].actorRole, "STAFF");
+    assert.equal(database.auditEvents[0].targetId, null);
+    assert.ok(database.auditEvents[0].createdAt instanceof Date);
+    assert.equal(JSON.stringify(database.auditEvents).includes(sessionCookie(response).split("=")[1]), false);
   });
 });
 
@@ -2441,6 +2575,28 @@ test("invalid credentials use the same response for unknown usernames", async ()
     assert.equal(wrongPassword.status, 401);
     assert.equal(unknownUser.status, 401);
     assert.deepEqual(await wrongPassword.json(), await unknownUser.json());
+    assert.deepEqual(database.auditEvents.map(({ eventType, outcome, actorUserId }) => ({
+      eventType,
+      outcome,
+      actorUserId,
+    })), [
+      { eventType: "AUTH_LOGIN_FAILURE", outcome: "FAILURE", actorUserId: 41 },
+      { eventType: "AUTH_LOGIN_FAILURE", outcome: "FAILURE", actorUserId: null },
+    ]);
+    assert.equal(JSON.stringify(database.auditEvents).includes("wrong-password"), false);
+    assert.equal(JSON.stringify(database.auditEvents).includes("operator.one"), false);
+  });
+});
+
+test("audit write failures reject login without creating a session", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  database.failAuditWrite = true;
+  await withAuthApi(database, async (baseUrl) => {
+    const response = await login(baseUrl);
+    assert.equal(response.status, 503);
+    assert.equal(database.sessions.size, 0);
+    assert.equal(database.auditEvents.length, 0);
+    assert.equal(database.users[0].failedLoginAttempts, 0);
   });
 });
 
@@ -2474,6 +2630,11 @@ test("malformed login credentials are rejected with the generic response", async
     assert.ok(bodies.every((body) => body.message === bodies[0].message));
     assert.equal(database.users[0].failedLoginAttempts, 0);
     assert.equal(database.sessions.size, 0);
+    assert.equal(database.auditEvents.length, 4);
+    assert.ok(database.auditEvents.every((event) =>
+      event.eventType === "AUTH_LOGIN_FAILURE" &&
+      event.outcome === "FAILURE"
+    ));
   });
 });
 
@@ -2492,6 +2653,11 @@ test("three failed logins lock the user and requests are rejected during the loc
     assert.ok(lockDuration <= 15 * 60 * 1000);
     const correctDuringLock = await login(baseUrl);
     assert.equal(correctDuringLock.status, 401);
+    assert.ok(database.auditEvents.some((event) =>
+      event.eventType === "AUTH_ACCOUNT_LOCKED" &&
+      event.outcome === "DENIED" &&
+      event.actorUserId === user.userId
+    ));
   });
 });
 
@@ -2610,6 +2776,20 @@ test("staff cannot access admin endpoints while admins can", async () => {
       headers: { Cookie: sessionCookie(loggedIn) },
     });
     assert.equal(reports.status, 403);
+    const auditLogs = await fetch(`${baseUrl}/admin/audit-logs`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(auditLogs.status, 403);
+    assert.ok(staffDatabase.auditEvents.some((event) =>
+      event.eventType === "AUTHORIZATION_DENIED" &&
+      event.outcome === "DENIED" &&
+      event.actorUserId === 41
+    ));
+    staffDatabase.failAuditWrite = true;
+    const stillDenied = await fetch(`${baseUrl}/admin/audit-logs`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(stillDenied.status, 403);
   });
 
   const adminDatabase = new FakeAuthPool([await makeAuthUser({ role: "ADMIN" })]);
@@ -2624,6 +2804,17 @@ test("staff cannot access admin endpoints while admins can", async () => {
       headers: { Cookie: sessionCookie(loggedIn) },
     });
     assert.equal(reports.status, 200);
+    const auditLogs = await fetch(`${baseUrl}/admin/audit-logs?limit=10`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(auditLogs.status, 200);
+    const auditResult = await auditLogs.json();
+    assert.deepEqual(auditResult.auditLogs.map((event) => event.eventType),
+      adminDatabase.auditEvents.slice(-10).reverse().map((event) => event.eventType));
+    const invalidLimit = await fetch(`${baseUrl}/admin/audit-logs?limit=101`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(invalidLimit.status, 400);
   });
 });
 
@@ -2644,6 +2835,10 @@ test("logout destroys the session and prevents later access", async () => {
       fetch(`${baseUrl}/admin/staff`, { headers: { Cookie: cookie } }),
     ]);
     assert.ok(protectedResponses.every((response) => response.status === 401));
+    assert.ok(database.auditEvents.some((event) =>
+      event.eventType === "AUTH_LOGOUT" &&
+      event.actorUserId === 41
+    ));
   });
 });
 

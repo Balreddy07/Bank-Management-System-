@@ -2,11 +2,20 @@
 const express = require("express");
 const { randomInt, randomUUID } = require("node:crypto");
 const { requireRole } = require("../auth/middleware");
+const { writeAuditEvent } = require("../audit-logger");
 const pool = require("../db");
 
 function generateAccountNumber() {
   // Always generates exactly 10 numeric digits.
   return String(randomInt(1_000_000_000, 10_000_000_000));
+}
+
+async function writeFailedAccountAudit(databasePool, event) {
+  try {
+    await writeAuditEvent(databasePool, event);
+  } catch (error) {
+    console.error("Account audit write failed:", error.code || "unknown error");
+  }
 }
 
 function createDeactivateAccountHandler(databasePool) {
@@ -29,14 +38,38 @@ function createDeactivateAccountHandler(databasePool) {
       if (!accounts.length) {
         await connection.rollback();
         transactionStarted = false;
+        await writeFailedAccountAudit(databasePool, {
+          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          outcome: "FAILURE",
+          actorUserId: req.user?.userId ?? null,
+          actorRole: req.user?.role ?? null,
+          targetType: "account",
+          targetId: accountNumber,
+        });
         return res.status(404).json({ message: "Account not found." });
       }
       if (accounts[0].status !== "ACTIVE") {
         await connection.rollback();
         transactionStarted = false;
+        await writeFailedAccountAudit(databasePool, {
+          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          outcome: "FAILURE",
+          actorUserId: req.user?.userId ?? null,
+          actorRole: req.user?.role ?? null,
+          targetType: "account",
+          targetId: accountNumber,
+        });
         return res.status(409).json({ message: "Account is already inactive." });
       }
       await connection.execute("UPDATE accounts SET status = 'INACTIVE' WHERE account_id = ?", [accounts[0].account_id]);
+      await writeAuditEvent(connection, {
+        eventType: "ACCOUNT_DEACTIVATION_SUCCESS",
+        outcome: "SUCCESS",
+        actorUserId: req.user?.userId ?? null,
+        actorRole: req.user?.role ?? null,
+        targetType: "account",
+        targetId: accountNumber,
+      });
       await connection.commit();
       transactionStarted = false;
       return res.status(200).json({ message: "Account deactivated.", accountNumber, status: "INACTIVE" });
@@ -181,6 +214,14 @@ router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) 
     if (!accounts.length) {
       await connection.rollback();
       transactionStarted = false;
+      await writeFailedAccountAudit(databasePool, {
+        eventType: "ACCOUNT_EDIT_FAILURE",
+        outcome: "FAILURE",
+        actorUserId: req.user?.userId ?? null,
+        actorRole: req.user?.role ?? null,
+        targetType: "account",
+        targetId: accountNumber,
+      });
       return res.status(404).json({ message: "Account not found." });
     }
 
@@ -188,6 +229,14 @@ router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) 
       "UPDATE customers SET full_name = ?, address = ?, phone = ? WHERE customer_id = ?",
       [fullName.trim(), address.trim(), normalizedPhone, accounts[0].customer_id]
     );
+    await writeAuditEvent(connection, {
+      eventType: "ACCOUNT_EDIT_SUCCESS",
+      outcome: "SUCCESS",
+      actorUserId: req.user?.userId ?? null,
+      actorRole: req.user?.role ?? null,
+      targetType: "account",
+      targetId: accountNumber,
+    });
     await connection.commit();
     transactionStarted = false;
     return res.status(200).json({

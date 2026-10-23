@@ -45,6 +45,8 @@ Successful deposits and withdrawals return a receipt containing `transactionRef`
 
 Atomicity requires the `accounts` and `transactions` tables to use a transactional storage engine such as InnoDB. The banking table definitions are not included in this repository, so verify their storage engines in each deployed database before relying on rollback behavior.
 
+Clients may send an `Idempotency-Key` header (1–128 printable ASCII characters) with a deposit or withdrawal. Migration `002_create_transaction_idempotency.sql` creates a persistent InnoDB table with a unique scope per staff user, account, operation, and key. Run `npm run migrate` before enabling keyed requests. A repeated request with the same parameters returns the original committed receipt; reuse with different parameters returns HTTP 409. The balance update, transaction record, and idempotency record commit or roll back together. Requests without this optional header retain the existing API behavior and are not deduplicated.
+
 Reports include deposits, withdrawals, and transaction count for the requested dates, plus current active-account count and balance. Date ranges may span at most 367 calendar days.
 
 ## Endpoints

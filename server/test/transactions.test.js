@@ -443,6 +443,7 @@ class FakeAuthPool {
     this.users = users;
     this.customerUsers = [];
     this.sessions = new Map();
+    this.failSessionRead = false;
     this.account = {
       account_id: 61,
       account_number: ACCOUNT_NUMBER,
@@ -752,6 +753,11 @@ class FakeAuthPool {
       return [[{ activeAccountCount: 1, totalBalance: "500.00" }]];
     }
     if (sql.includes("SELECT data FROM user_sessions")) {
+      if (this.failSessionRead) {
+        const error = new Error(`Simulated session-store failure for ${params[0]}`);
+        error.code = "TEST_SESSION_STORE_FAILURE";
+        throw error;
+      }
       const stored = this.sessions.get(params[0]);
       return [[stored && stored.expires > Math.floor(Date.now() / 1000) ? { data: stored.data } : null].filter(Boolean)];
     }
@@ -764,6 +770,13 @@ class FakeAuthPool {
       if (stored) {
         stored.expires = Number(params[0]);
         stored.data = params[1];
+      }
+      return [{ affectedRows: stored ? 1 : 0 }];
+    }
+    if (sql.includes("DELETE FROM user_sessions WHERE session_id = ? AND expires <= UNIX_TIMESTAMP()")) {
+      const stored = this.sessions.get(params[0]);
+      if (stored && stored.expires <= Math.floor(Date.now() / 1000)) {
+        this.sessions.delete(params[0]);
       }
       return [{ affectedRows: stored ? 1 : 0 }];
     }
@@ -2409,8 +2422,14 @@ test("successful login returns a safe user and HTTP-only session cookie", async 
     assert.equal(response.status, 200);
     assert.deepEqual(result.user, { userId: 41, username: "operator.one", role: "STAFF" });
     assert.match(response.headers.get("set-cookie"), /HttpOnly/i);
+    assert.match(response.headers.get("set-cookie"), /SameSite=Lax/i);
+    const cookieExpiry = new Date(response.headers.get("set-cookie").match(/Expires=([^;]+)/i)[1]).getTime();
+    const remainingLifetime = cookieExpiry - Date.now();
+    assert.ok(remainingLifetime <= 30 * 60 * 1000);
+    assert.ok(remainingLifetime >= 29 * 60 * 1000);
     assert.notEqual(sessionCookie(response).split("=")[1], "attacker-controlled-session-id");
     assert.equal(JSON.stringify(result).includes("passwordHash"), false);
+    assert.equal(JSON.stringify(result).includes(sessionCookie(response).split("=")[1]), false);
   });
 });
 
@@ -2618,10 +2637,13 @@ test("logout destroys the session and prevents later access", async () => {
       headers: { Cookie: cookie },
     });
     assert.equal(logout.status, 200);
-    const protectedResponse = await fetch(`${baseUrl}/accounts`, {
-      headers: { Cookie: cookie },
-    });
-    assert.equal(protectedResponse.status, 401);
+    const protectedResponses = await Promise.all([
+      fetch(`${baseUrl}/accounts`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/admin/staff`, { headers: { Cookie: cookie } }),
+    ]);
+    assert.ok(protectedResponses.every((response) => response.status === 401));
   });
 });
 
@@ -2643,6 +2665,84 @@ test("MySQL session store persists, reads, touches, and destroys sessions", asyn
     assert.equal(logout.status, 200);
     assert.equal(database.sessions.size, 0);
   }, { persistentSessions: true });
+});
+
+test("expired sessions are rejected across protected routes and only their record is removed", async () => {
+  const staff = await makeAuthUser();
+  const otherStaff = {
+    ...await makeAuthUser(),
+    userId: 42,
+    username: "staff.member",
+  };
+  const database = new FakeAuthPool([staff, otherStaff]);
+  await withAuthApi(database, async (baseUrl) => {
+    const expiredLogin = await login(baseUrl, "operator.one");
+    const activeLogin = await login(baseUrl, "staff.member");
+    const expiredCookie = sessionCookie(expiredLogin);
+    const activeCookie = sessionCookie(activeLogin);
+    const expiredSessionId = decodeURIComponent(expiredCookie.split("=")[1]).slice(2).split(".")[0];
+    const activeSessionId = decodeURIComponent(activeCookie.split("=")[1]).slice(2).split(".")[0];
+    assert.equal(expiredLogin.status, 200);
+    assert.equal(activeLogin.status, 200);
+    assert.equal(database.sessions.size, 2);
+
+    database.sessions.get(expiredSessionId).expires = Math.floor(Date.now() / 1000) - 1;
+
+    const protectedResponses = await Promise.all([
+      fetch(`${baseUrl}/accounts`, { headers: { Cookie: expiredCookie } }),
+      fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, { headers: { Cookie: expiredCookie } }),
+      fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, { headers: { Cookie: expiredCookie } }),
+      fetch(`${baseUrl}/admin/staff`, { headers: { Cookie: expiredCookie } }),
+    ]);
+    assert.ok(protectedResponses.every((response) => response.status === 401));
+    assert.equal(database.sessions.has(expiredSessionId), false);
+    assert.equal(database.sessions.has(activeSessionId), true);
+
+    const activeResponse = await fetch(
+      `${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`,
+      { headers: { Cookie: activeCookie } }
+    );
+    assert.equal(activeResponse.status, 200);
+  }, { persistentSessions: true });
+});
+
+test("invalid session identifiers are rejected by protected routes", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const cookie = "securebank.sid=invalid-session-signature";
+    const responses = await Promise.all([
+      fetch(`${baseUrl}/accounts`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, { headers: { Cookie: cookie } }),
+    ]);
+    assert.ok(responses.every((response) => response.status === 401));
+  });
+});
+
+test("session identifiers are not returned in response bodies or server logs", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  const loggedErrors = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => loggedErrors.push(args.join(" "));
+  try {
+    await withAuthApi(database, async (baseUrl) => {
+      const loggedIn = await login(baseUrl);
+      const sessionId = sessionCookie(loggedIn).split("=")[1];
+      const body = await loggedIn.json();
+      assert.equal(JSON.stringify(body).includes(sessionId), false);
+
+      database.failSessionRead = true;
+      const failedRequest = await fetch(`${baseUrl}/accounts`, {
+        headers: { Cookie: sessionCookie(loggedIn) },
+      });
+      const failureBody = await failedRequest.text();
+      assert.equal(failedRequest.status, 500);
+      assert.equal(failureBody.includes(sessionId), false);
+      assert.equal(loggedErrors.join(" ").includes(sessionId), false);
+    }, { persistentSessions: true });
+  } finally {
+    console.error = originalConsoleError;
+  }
 });
 
 test("admin can create staff, change another user's role, and deactivate an account", async () => {

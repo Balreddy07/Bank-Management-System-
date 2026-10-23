@@ -3695,3 +3695,6 @@
     font-size: 13px;
   }
 }
+.customer-transaction-layout {
+  grid-template-columns: minmax(0, 1fr);
+}

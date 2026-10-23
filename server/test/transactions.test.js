@@ -435,6 +435,7 @@ class FakeCustomerAccountPool {
 class FakeAuthPool {
   constructor(users) {
     this.users = users;
+    this.customerUsers = [];
     this.sessions = new Map();
     this.account = {
       account_id: 61,
@@ -455,6 +456,20 @@ class FakeAuthPool {
       address: "1 Old Road",
       phone: "9876543210",
     };
+    this.otherAccount = {
+      accountId: 63,
+      accountNumber: "1098765432",
+      balance: "3200.00",
+      status: "ACTIVE",
+      createdAt: new Date("2026-01-03T03:04:05.000Z"),
+      customerId: 99,
+    };
+    this.otherCustomer = {
+      customerId: 99,
+      fullName: "Other Customer",
+      address: "9 Other Road",
+      phone: "9876543212",
+    };
     this.transactions = [];
     this.idempotencyRecords = new Map();
     this.lockTail = Promise.resolve();
@@ -474,6 +489,7 @@ class FakeAuthPool {
     const database = this;
     let unlock;
     let stagedUser;
+    let stagedCustomerUser;
     return {
       async beginTransaction() {
         unlock = await database.acquireLock();
@@ -482,6 +498,21 @@ class FakeAuthPool {
         if (sql.includes("SELECT data FROM user_sessions WHERE session_id = ? AND expires > UNIX_TIMESTAMP()")) {
           const stored = database.sessions.get(params[0]);
           return [[stored && stored.expires > Math.floor(Date.now() / 1000) ? { data: stored.data } : null].filter(Boolean)];
+        }
+        if (sql.includes("FROM customer_users") && sql.includes("WHERE username = ?")) {
+          const customerUser = database.customerUsers.find((entry) => entry.username === params[0]);
+          if (!customerUser) return [[]];
+          const lockUntil = customerUser.lockedUntil ? new Date(customerUser.lockedUntil) : null;
+          return [[{
+            customerId: customerUser.customerId,
+            username: customerUser.username,
+            passwordHash: customerUser.passwordHash,
+            failedLoginAttempts: customerUser.failedLoginAttempts,
+            lockedUntil: lockUntil,
+            isActive: customerUser.isActive,
+            lockActive: lockUntil && lockUntil > new Date() ? 1 : 0,
+            lockExpired: lockUntil && lockUntil <= new Date() ? 1 : 0,
+          }]];
         }
         if (sql.includes("WHERE username = ?")) {
           const user = database.users.find((entry) => entry.username === params[0]);
@@ -498,6 +529,22 @@ class FakeAuthPool {
             lockActive: lockUntil && lockUntil > new Date() ? 1 : 0,
             lockExpired: lockUntil && lockUntil <= new Date() ? 1 : 0,
           }]];
+        }
+        if (sql.includes("UPDATE customer_users") && sql.includes("failed_login_attempts = ?")) {
+          const customerUser = database.customerUsers.find((entry) => entry.customerId === params[3]);
+          stagedCustomerUser = {
+            ...customerUser,
+            failedLoginAttempts: params[0],
+            lockedUntil: params[1] >= params[2]
+              ? new Date(Date.now() + 15 * 60 * 1000)
+              : null,
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("UPDATE customer_users SET failed_login_attempts = 0")) {
+          const customerUser = database.customerUsers.find((entry) => entry.customerId === params[0]);
+          stagedCustomerUser = { ...customerUser, failedLoginAttempts: 0, lockedUntil: null };
+          return [{ affectedRows: 1 }];
         }
         if (sql.includes("SET failed_login_attempts = ?,")) {
           assert.equal((sql.match(/\?/g) || []).length, params.length);
@@ -560,6 +607,12 @@ class FakeAuthPool {
           const index = database.users.findIndex((entry) => entry.userId === stagedUser.userId);
           database.users[index] = stagedUser;
         }
+        if (stagedCustomerUser) {
+          const index = database.customerUsers.findIndex(
+            (entry) => entry.customerId === stagedCustomerUser.customerId
+          );
+          database.customerUsers[index] = stagedCustomerUser;
+        }
         if (database.pendingAccountStatus) {
           database.account.status = database.pendingAccountStatus.status;
           database.pendingAccountStatus = null;
@@ -578,20 +631,70 @@ class FakeAuthPool {
   }
 
   async execute(sql, params) {
+    if (sql.includes("SELECT customer_id AS customerId, username") && sql.includes("FROM customer_users")) {
+      const customerUser = this.customerUsers.find(
+        (entry) => entry.customerId === Number(params[0]) && entry.isActive
+      );
+      return [customerUser ? [{
+        customerId: customerUser.customerId,
+        username: customerUser.username,
+      }] : []];
+    }
+    if (sql.includes("SELECT customer_id FROM customers WHERE customer_id = ?")) {
+      return [params[0] === this.customer.customerId ? [{ customer_id: params[0] }] : []];
+    }
+    if (sql.includes("SELECT user_id FROM staff_users WHERE username = ?")) {
+      return [this.users.some((user) => user.username === params[0]) ? [{ user_id: 1 }] : []];
+    }
+    if (sql.includes("INSERT INTO customer_users")) {
+      if (this.customerUsers.some((user) => user.customerId === params[0] || user.username === params[1])) {
+        const error = new Error("Duplicate customer username or identity.");
+        error.code = "ER_DUP_ENTRY";
+        throw error;
+      }
+      this.customerUsers.push({
+        customerId: params[0],
+        username: params[1],
+        passwordHash: params[2],
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        isActive: 1,
+      });
+      return [{ affectedRows: 1 }];
+    }
     if (sql.includes("SELECT account_number AS accountNumber, balance, status")) {
-      if (params[0] !== this.account.account_number) return [[]];
+      const account = params[0] === this.account.account_number
+        ? this.account
+        : params[0] === this.otherAccount.accountNumber
+          ? this.otherAccount
+          : null;
+      if (!account) return [[]];
+      const accountCustomerId = account.customer_id ?? account.customerId;
+      if (params[1] !== null && params[1] !== accountCustomerId) return [[]];
       return [[{
-        accountNumber: this.account.account_number,
-        balance: this.account.balance,
-        status: this.account.status,
+        accountNumber: account.account_number || account.accountNumber,
+        balance: account.balance,
+        status: account.status,
       }]];
     }
     if (sql.includes("FROM transactions") && sql.includes("account_id = (")) {
-      return [[...this.transactions]];
+      const isOtherAccount = params[0] === this.otherAccount.accountNumber;
+      if (isOtherAccount) return [[]];
+      return [this.transactions.filter((transaction) =>
+        params[1] === null ||
+        (transaction.customerId ?? this.customer.customerId) === params[1]
+      )];
     }
-    if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
-      if (params[0] !== this.account.accountNumber) return [[]];
-      return [[{
+    if (sql.includes("FROM transactions t") && sql.includes("WHERE t.transaction_ref = ?")) {
+      const transaction = this.transactions.find((item) => item.transactionRef === params[0]);
+      const transactionOwner = transaction?.customerId ?? this.customer.customerId;
+      if (!transaction || (params[1] !== null && transactionOwner !== params[1])) return [[]];
+      return [[transaction]];
+    }
+    if (sql.includes("FROM accounts a") && sql.includes("ORDER BY a.created_at DESC")) {
+      const search = String(params[0] || "").toLowerCase();
+      const customerId = params[3];
+      const accountResults = [{
         accountId: this.account.accountId,
         accountNumber: this.account.accountNumber,
         balance: this.account.balance,
@@ -601,6 +704,39 @@ class FakeAuthPool {
         fullName: this.customer.fullName,
         address: this.customer.address,
         phone: this.customer.phone,
+      }, {
+        ...this.otherAccount,
+        fullName: this.otherCustomer.fullName,
+        phone: this.otherCustomer.phone,
+      }];
+      return [accountResults.filter((account) =>
+        (customerId === null || account.customerId === customerId) &&
+        (!search ||
+          String(account.accountNumber).toLowerCase().includes(search) ||
+          String(account.fullName).toLowerCase().includes(search))
+      )];
+    }
+    if (sql.includes("FROM accounts a") && sql.includes("WHERE a.account_number = ?")) {
+      const isOwnAccount = params[0] === this.account.accountNumber;
+      const isOtherAccount = params[0] === this.otherAccount.accountNumber;
+      if (!isOwnAccount && !isOtherAccount) return [[]];
+      const customerId = isOwnAccount ? this.customer.customerId : this.otherAccount.customerId;
+      if (params[1] !== null && params[1] !== customerId) return [[]];
+      return [[isOwnAccount ? {
+        accountId: this.account.accountId,
+        accountNumber: this.account.accountNumber,
+        balance: this.account.balance,
+        status: this.account.status,
+        createdAt: this.account.createdAt,
+        customerId: this.customer.customerId,
+        fullName: this.customer.fullName,
+        address: this.customer.address,
+        phone: this.customer.phone,
+      } : {
+        ...this.otherAccount,
+        address: this.otherCustomer.address,
+        fullName: this.otherCustomer.fullName,
+        phone: this.otherCustomer.phone,
       }]];
     }
     if (sql.includes("transactionCount")) {
@@ -708,6 +844,10 @@ async function withApi(database, run) {
 async function withAccountApi(database, run) {
   const app = express();
   app.use(express.json());
+  app.use((req, res, next) => {
+    req.user = { userId: 41, role: "ADMIN" };
+    next();
+  });
   app.use("/api/accounts", createAccountRouter(database));
   const server = app.listen(0);
   await once(server, "listening");
@@ -1954,6 +2094,266 @@ test("authenticated staff can view, edit, and deactivate customer accounts", asy
     });
     assert.equal(deactivated.status, 200);
     assert.equal(database.account.status, "INACTIVE");
+  });
+});
+
+test("missing or unsupported roles cannot access banking or administrative routes", async () => {
+  for (const invalidRole of [null, "SUPERADMIN"]) {
+    const user = await makeAuthUser({ role: invalidRole });
+    if (invalidRole === null) user.role = undefined;
+    const database = new FakeAuthPool([user]);
+    await withAuthApi(database, async (baseUrl) => {
+      const loggedIn = await login(baseUrl);
+      assert.equal(loggedIn.status, 200);
+      const headers = {
+        Cookie: sessionCookie(loggedIn),
+        "Content-Type": "application/json",
+      };
+      const requests = [
+        fetch(`${baseUrl}/accounts`, { headers }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, { headers }),
+        fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, { headers }),
+        fetch(`${baseUrl}/transactions/00000000-0000-4000-8000-000000000001`, { headers }),
+        fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, { headers }),
+        fetch(`${baseUrl}/admin/staff`, { headers }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            fullName: "Unauthorized Change",
+            address: "2 New Road",
+            phone: "9876543211",
+          }),
+        }),
+        fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ confirm: true }),
+        }),
+        fetch(`${baseUrl}/transactions/deposit`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+        }),
+        fetch(`${baseUrl}/transactions/withdraw`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+        }),
+        fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ confirm: true }),
+        }),
+      ];
+      const responses = await Promise.all(requests);
+      assert.ok(responses.every((response) => response.status === 403));
+      assert.equal(database.account.balance, "2500.00");
+      assert.equal(database.account.status, "ACTIVE");
+      assert.equal(database.customer.fullName, "Asha Sharma");
+      assert.equal(database.transactions.length, 0);
+    });
+  }
+});
+
+test("customer sessions can read only their own account and transaction history", async () => {
+  const customerPassword = "Customer-Strong-Password-42!";
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  database.customerUsers.push({
+    customerId: 62,
+    username: "asha.customer",
+    passwordHash: await bcrypt.hash(customerPassword, 4),
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    isActive: 1,
+  });
+  database.transactions.push({
+    transactionRef: "c6b7164e-10fd-46b2-8e6c-3a7fd24025ec",
+    type: "DEPOSIT",
+    amount: "500.00",
+    balanceAfter: "2500.00",
+    createdAt: new Date("2026-01-02T03:04:05.000Z"),
+    customerId: 62,
+  }, {
+    transactionRef: "e6b7164e-10fd-46b2-8e6c-3a7fd24025ec",
+    type: "DEPOSIT",
+    amount: "300.00",
+    balanceAfter: "3200.00",
+    createdAt: new Date("2026-01-03T03:04:05.000Z"),
+    customerId: 99,
+  });
+
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl, "asha.customer", customerPassword);
+    const result = await loggedIn.json();
+    assert.equal(loggedIn.status, 200);
+    assert.deepEqual(result.user, {
+      userId: 62,
+      customerId: 62,
+      username: "asha.customer",
+      role: "CUSTOMER",
+    });
+
+    const cookie = sessionCookie(loggedIn);
+    const sessionResponse = await fetch(`${baseUrl}/auth/session`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual((await sessionResponse.json()).user, result.user);
+
+    const accountsResponse = await fetch(`${baseUrl}/accounts`, {
+      headers: { Cookie: cookie },
+    });
+    const accounts = await accountsResponse.json();
+    assert.equal(accountsResponse.status, 200);
+    assert.deepEqual(accounts.accounts.map((account) => account.accountNumber), [ACCOUNT_NUMBER]);
+
+    const otherCustomerSearch = await fetch(
+      `${baseUrl}/accounts?search=${encodeURIComponent(database.otherCustomer.fullName)}`,
+      { headers: { Cookie: cookie } }
+    );
+    assert.equal(otherCustomerSearch.status, 200);
+    assert.deepEqual((await otherCustomerSearch.json()).accounts, []);
+
+    const ownedAccount = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(ownedAccount.status, 200);
+
+    const otherAccount = await fetch(`${baseUrl}/accounts/${database.otherAccount.accountNumber}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(otherAccount.status, 404);
+    assert.equal((await otherAccount.json()).message, "Account not found.");
+
+    const ownedHistory = await fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(ownedHistory.status, 200);
+    assert.equal((await ownedHistory.json()).transactions.length, 1);
+
+    const otherHistory = await fetch(
+      `${baseUrl}/transactions?accountNumber=${database.otherAccount.accountNumber}`,
+      { headers: { Cookie: cookie } }
+    );
+    assert.equal(otherHistory.status, 404);
+    assert.equal((await otherHistory.json()).message, "Account not found.");
+
+    const ownedReceipt = await fetch(
+      `${baseUrl}/transactions/c6b7164e-10fd-46b2-8e6c-3a7fd24025ec`,
+      { headers: { Cookie: cookie } }
+    );
+    assert.equal(ownedReceipt.status, 200);
+
+    const otherReceipt = await fetch(
+      `${baseUrl}/transactions/e6b7164e-10fd-46b2-8e6c-3a7fd24025ec`,
+      { headers: { Cookie: cookie } }
+    );
+    assert.equal(otherReceipt.status, 404);
+    assert.equal((await otherReceipt.json()).message, "Transaction not found.");
+
+    const forbiddenRequests = [
+      fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}`, {
+        method: "PATCH",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fullName: "Unauthorized Change",
+          address: "2 New Road",
+          phone: "9876543211",
+        }),
+      }),
+      fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+        method: "PATCH",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      }),
+      fetch(`${baseUrl}/accounts`, {
+        method: "POST",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fullName: "Unauthorized Account",
+          address: "2 New Road",
+          phone: "9876543211",
+          idProofType: "PAN",
+          idProofNumber: "ABCDE1234F",
+          initialDeposit: 500,
+        }),
+      }),
+      fetch(`${baseUrl}/transactions/deposit`, {
+        method: "POST",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+      }),
+      fetch(`${baseUrl}/transactions/withdraw`, {
+        method: "POST",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ accountNumber: database.otherAccount.accountNumber, amount: 100 }),
+      }),
+      fetch(`${baseUrl}/reports?startDate=2026-01-01&endDate=2026-01-31`, {
+        headers: { Cookie: cookie },
+      }),
+      fetch(`${baseUrl}/admin/staff`, { headers: { Cookie: cookie } }),
+      fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+        method: "PATCH",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      }),
+    ];
+    const responses = await Promise.all(forbiddenRequests);
+    assert.ok(responses.every((response) => response.status === 403));
+    assert.equal(database.account.balance, "2500.00");
+    assert.equal(database.account.status, "ACTIVE");
+    assert.equal(database.customer.fullName, "Asha Sharma");
+    assert.equal(database.transactions.length, 2);
+  });
+});
+
+test("administrator can provision a hashed customer login but staff cannot", async () => {
+  const database = new FakeAuthPool([await makeAuthUser()]);
+  await withAuthApi(database, async (baseUrl) => {
+    const staffLogin = await login(baseUrl);
+    const staffResponse = await fetch(`${baseUrl}/admin/customer-users`, {
+      method: "POST",
+      headers: {
+        Cookie: sessionCookie(staffLogin),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        customerId: 62,
+        username: "asha.customer",
+        password: "Customer-Strong-Password-42!",
+      }),
+    });
+    assert.equal(staffResponse.status, 403);
+
+    const adminDatabase = new FakeAuthPool([await makeAuthUser({ role: "ADMIN" })]);
+    await withAuthApi(adminDatabase, async (adminBaseUrl) => {
+      const adminLogin = await login(adminBaseUrl);
+      const response = await fetch(`${adminBaseUrl}/admin/customer-users`, {
+        method: "POST",
+        headers: {
+          Cookie: sessionCookie(adminLogin),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          customerId: 62,
+          username: "asha.customer",
+          password: "Customer-Strong-Password-42!",
+        }),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 201);
+      assert.deepEqual(body.customer, {
+        customerId: 62,
+        username: "asha.customer",
+        role: "CUSTOMER",
+      });
+      assert.equal(adminDatabase.customerUsers.length, 1);
+      assert.notEqual(adminDatabase.customerUsers[0].passwordHash, "Customer-Strong-Password-42!");
+      assert.equal(
+        await bcrypt.compare("Customer-Strong-Password-42!", adminDatabase.customerUsers[0].passwordHash),
+        true
+      );
+    });
   });
 });
 

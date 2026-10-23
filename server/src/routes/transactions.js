@@ -1,5 +1,5 @@
 const express = require("express");
-const { randomUUID } = require("node:crypto");
+const { createHash, randomUUID } = require("node:crypto");
 const pool = require("../db");
 
 const MAX_BALANCE_CENTS = 999999999999n;
@@ -32,6 +32,12 @@ function getDuplicateKeyName(error) {
   const message = error.sqlMessage || error.message || "";
   const match = /\bfor key\s+['"`]([^'"`]+)['"`]\s*$/i.exec(message);
   return match ? match[1].split(".").pop() : null;
+}
+
+function getIdempotencyRequestHash(transactionType, accountNumber, amount) {
+  return createHash("sha256")
+    .update(`${transactionType}\0${accountNumber}\0${amount}`)
+    .digest("hex");
 }
 
 function createTransactionRouter(
@@ -139,6 +145,18 @@ async function processBalanceChange(
     return res.status(400).json({ message: "Amount must be positive and have at most two decimal places." });
   }
 
+  const idempotencyKey = req.get("Idempotency-Key");
+  if (idempotencyKey !== undefined && !/^[\x21-\x7e]{1,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: "Enter a valid Idempotency-Key header." });
+  }
+  if (idempotencyKey && !req.user?.userId) {
+    return res.status(401).json({ message: "Authentication is required for idempotent transactions." });
+  }
+
+  const amountValue = formatMoneyCents(amountCents);
+  const requestHash = idempotencyKey
+    ? getIdempotencyRequestHash(transactionType, accountNumber, amountValue)
+    : null;
   let connection;
   let transactionStarted = false;
 
@@ -146,6 +164,65 @@ async function processBalanceChange(
     connection = await databasePool.getConnection();
     await connection.beginTransaction();
     transactionStarted = true;
+
+    if (idempotencyKey) {
+      try {
+        await connection.execute(
+          `INSERT INTO transaction_idempotency
+           (user_id, account_number, transaction_type, idempotency_key, request_hash)
+           VALUES (?, ?, ?, ?, ?)`,
+          [req.user.userId, accountNumber, transactionType, idempotencyKey, requestHash]
+        );
+      } catch (error) {
+        if (error.code !== "ER_DUP_ENTRY") throw error;
+
+        await connection.rollback();
+        transactionStarted = false;
+        const [existingRequests] = await databasePool.execute(
+          `SELECT request_hash AS requestHash, transaction_ref AS transactionRef
+           FROM transaction_idempotency
+           WHERE user_id = ?
+             AND account_number = ?
+             AND transaction_type = ?
+             AND idempotency_key = ?`,
+          [req.user.userId, accountNumber, transactionType, idempotencyKey]
+        );
+        const existingRequest = existingRequests[0];
+        if (!existingRequest) throw error;
+        if (existingRequest.requestHash !== requestHash) {
+          return res.status(409).json({
+            message: "This Idempotency-Key was already used for a different transaction.",
+          });
+        }
+        if (!existingRequest.transactionRef) {
+          throw new Error("Committed idempotency record is missing its transaction reference.");
+        }
+
+        const [existingTransactions] = await databasePool.execute(
+          `SELECT transaction_ref AS transactionRef,
+                  transaction_type AS type,
+                  amount,
+                  balance_after AS balanceAfter,
+                  created_at AS createdAt
+           FROM transactions
+           WHERE transaction_ref = ?`,
+          [existingRequest.transactionRef]
+        );
+        if (existingTransactions.length === 0) {
+          throw new Error("Committed idempotency record has no matching transaction.");
+        }
+
+        const transaction = existingTransactions[0];
+        return res.status(201).json({
+          message: transactionType === "DEPOSIT" ? "Deposit completed." : "Withdrawal completed.",
+          account: {
+            accountNumber,
+            balance: transaction.balanceAfter,
+          },
+          transaction,
+        });
+      }
+    }
 
     const [accounts] = await connection.execute(
       `SELECT account_id, account_number, balance, status
@@ -186,8 +263,6 @@ async function processBalanceChange(
     }
 
     const balanceAfter = formatMoneyCents(nextBalanceCents);
-    const amountValue = formatMoneyCents(amountCents);
-
     await connection.execute(
       "UPDATE accounts SET balance = ? WHERE account_id = ?",
       [balanceAfter, account.account_id]
@@ -266,6 +341,21 @@ async function processBalanceChange(
       throw error;
     }
 
+    if (idempotencyKey) {
+      const [updateResult] = await connection.execute(
+        `UPDATE transaction_idempotency
+         SET transaction_ref = ?
+         WHERE user_id = ?
+           AND account_number = ?
+           AND transaction_type = ?
+           AND idempotency_key = ?`,
+        [transactionRef, req.user.userId, accountNumber, transactionType, idempotencyKey]
+      );
+      if (updateResult.affectedRows !== 1) {
+        throw new Error("Transaction idempotency record could not be completed.");
+      }
+    }
+
     await connection.commit();
     transactionStarted = false;
 
@@ -287,6 +377,13 @@ async function processBalanceChange(
     }
 
     console.error("Account transaction failed:", error.code || "unknown error");
+    if (error.code === "ER_LOCK_DEADLOCK" || error.code === "ER_LOCK_WAIT_TIMEOUT") {
+      return res.status(503).json({
+        message: idempotencyKey
+          ? "Transaction is temporarily unavailable. Retry with the same Idempotency-Key."
+          : "Transaction is temporarily unavailable. Please try again.",
+      });
+    }
     return res.status(500).json({ message: "Transaction could not be completed. Please try again." });
   } finally {
     if (connection) connection.release();

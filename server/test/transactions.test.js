@@ -18,6 +18,7 @@ class FakePool {
     status = "ACTIVE",
     failInsert = false,
     failCommit = false,
+    failAccountLock = false,
     failDuplicateInsert = false,
     hideTransactionReceipt = false,
     duplicateTransactionRefs = [],
@@ -30,8 +31,10 @@ class FakePool {
       status,
     };
     this.transactions = [];
+    this.idempotencyRecords = new Map();
     this.failInsert = failInsert;
     this.failCommit = failCommit;
+    this.failAccountLock = failAccountLock;
     this.failDuplicateInsert = failDuplicateInsert;
     this.hideTransactionReceipt = hideTransactionReceipt;
     this.duplicateTransactionRefs = new Set(duplicateTransactionRefs);
@@ -60,6 +63,8 @@ class FakePool {
     let unlock;
     let stagedBalance;
     let stagedTransaction;
+    let stagedIdempotencyRecord;
+    let stagedIdempotencyScope;
 
     return {
       async beginTransaction() {
@@ -67,12 +72,38 @@ class FakePool {
         unlock = await database.acquireLock();
       },
       async execute(sql, params) {
+        if (sql.includes("INSERT INTO transaction_idempotency")) {
+          stagedIdempotencyScope = JSON.stringify(params.slice(0, 4));
+          if (database.idempotencyRecords.has(stagedIdempotencyScope)) {
+            const error = new Error("Duplicate entry for key 'uq_transaction_idempotency_scope'");
+            error.code = "ER_DUP_ENTRY";
+            error.sqlMessage = error.message;
+            throw error;
+          }
+          stagedIdempotencyRecord = {
+            requestHash: params[4],
+            transactionRef: null,
+          };
+          return [{ affectedRows: 1 }];
+        }
+
         if (sql.includes("FROM accounts") && sql.includes("FOR UPDATE")) {
+          if (database.failAccountLock) {
+            const error = new Error("simulated lock timeout");
+            error.code = "ER_LOCK_WAIT_TIMEOUT";
+            throw error;
+          }
           return [database.account.account_number === params[0] ? [{ ...database.account }] : []];
         }
 
         if (sql.startsWith("UPDATE accounts")) {
           stagedBalance = params[0];
+          return [{ affectedRows: 1 }];
+        }
+
+        if (sql.includes("UPDATE transaction_idempotency")) {
+          if (!stagedIdempotencyRecord) return [{ affectedRows: 0 }];
+          stagedIdempotencyRecord.transactionRef = params[0];
           return [{ affectedRows: 1 }];
         }
 
@@ -145,11 +176,16 @@ class FakePool {
         }
         if (stagedBalance !== undefined) database.account.balance = stagedBalance;
         if (stagedTransaction) database.transactions.push(stagedTransaction);
+        if (stagedIdempotencyRecord) {
+          database.idempotencyRecords.set(stagedIdempotencyScope, stagedIdempotencyRecord);
+        }
       },
       async rollback() {
         database.transactionLifecycle.rollbacks += 1;
         stagedBalance = undefined;
         stagedTransaction = undefined;
+        stagedIdempotencyRecord = undefined;
+        stagedIdempotencyScope = undefined;
       },
       release() {
         database.transactionLifecycle.releases += 1;
@@ -170,6 +206,22 @@ class FakePool {
   }
 
   async execute(sql, params) {
+    if (sql.includes("FROM transaction_idempotency")) {
+      const record = this.idempotencyRecords.get(JSON.stringify(params));
+      return [record ? [{
+        requestHash: record.requestHash,
+        transactionRef: record.transactionRef,
+      }] : []];
+    }
+
+    if (
+      sql.includes("FROM transactions") &&
+      sql.includes("WHERE transaction_ref = ?")
+    ) {
+      const transaction = this.transactions.find((item) => item.transaction_ref === params[0]);
+      return [transaction ? [this.toApiTransaction(transaction)] : []];
+    }
+
     if (sql.includes("transactionCount")) {
       assert.deepEqual(params, ["2026-01-01", "2026-01-31"]);
       return [[{
@@ -404,6 +456,7 @@ class FakeAuthPool {
       phone: "9876543210",
     };
     this.transactions = [];
+    this.idempotencyRecords = new Map();
     this.lockTail = Promise.resolve();
   }
 
@@ -621,9 +674,13 @@ class FakeAuthPool {
   }
 }
 
-async function startApi(database, transactionReferenceGenerator) {
+async function startApi(database, transactionReferenceGenerator, { userId = 41 } = {}) {
   const app = express();
   app.use(express.json());
+  app.use((req, res, next) => {
+    req.user = { userId, role: "ADMIN" };
+    next();
+  });
   app.use("/api/transactions", createTransactionRouter(
     database,
     transactionReferenceGenerator ? { transactionReferenceGenerator } : undefined
@@ -711,10 +768,12 @@ function sessionCookie(response) {
   return response.headers.get("set-cookie")?.split(";")[0];
 }
 
-async function post(baseUrl, path, body) {
+async function post(baseUrl, path, body, idempotencyKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (idempotencyKey !== undefined) headers["Idempotency-Key"] = idempotencyKey;
   const response = await fetch(`${baseUrl}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   return { status: response.status, body: await response.json() };
@@ -1111,6 +1170,211 @@ test("concurrent withdrawals cannot spend the same balance", async () => {
     assert.equal(database.account.balance, "1000.00");
     assert.equal(database.transactions.length, 1);
     assert.equal(database.transactions[0].balance_after, "1000.00");
+  });
+});
+
+test("concurrent deposits preserve both balance changes and transaction records", async () => {
+  const database = new FakePool({ balance: "1500.00" });
+  await withApi(database, async (baseUrl) => {
+    const results = await Promise.all([
+      post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+      post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 200 }),
+    ]);
+    assert.deepEqual(results.map((result) => result.status), [201, 201]);
+    assert.equal(database.account.balance, "1800.00");
+    assert.equal(database.transactions.length, 2);
+    assert.deepEqual(
+      database.transactions.map((transaction) => transaction.balance_after).sort(),
+      ["1600.00", "1800.00"]
+    );
+  });
+});
+
+test("concurrent withdrawals collectively preserve the minimum balance", async () => {
+  const database = new FakePool({ balance: "2600.00" });
+  await withApi(database, async (baseUrl) => {
+    const results = await Promise.all([
+      post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1000 }),
+      post(baseUrl, "/withdraw", { accountNumber: ACCOUNT_NUMBER, amount: 1000 }),
+    ]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [201, 422]);
+    assert.equal(database.account.balance, "1600.00");
+    assert.equal(database.transactions.length, 1);
+    assert.equal(database.transactions[0].balance_after, "1600.00");
+  });
+});
+
+test("concurrent submissions with one idempotency key commit one transaction and share its receipt", async () => {
+  const database = new FakePool();
+  const request = () => post(
+    api.baseUrl,
+    "/deposit",
+    { accountNumber: ACCOUNT_NUMBER, amount: 250 },
+    "same-logical-request-1"
+  );
+  const api = await startApi(database);
+  try {
+    const results = await Promise.all([request(), request()]);
+    assert.deepEqual(results.map((result) => result.status), [201, 201]);
+    assert.deepEqual(results[0].body, results[1].body);
+    assert.equal(database.account.balance, "1750.00");
+    assert.equal(database.transactions.length, 1);
+    assert.equal(database.idempotencyRecords.size, 1);
+  } finally {
+    await api.close();
+  }
+});
+
+test("repeated idempotent submissions return the original committed receipt", async () => {
+  const database = new FakePool();
+  const firstApi = await startApi(database);
+  let original;
+  try {
+    original = await post(
+      firstApi.baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 125 },
+      "persisted-request-2"
+    );
+    assert.equal(original.status, 201);
+  } finally {
+    await firstApi.close();
+  }
+
+  const restartedApi = await startApi(database);
+  try {
+    const repeated = await post(
+      restartedApi.baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 125 },
+      "persisted-request-2"
+    );
+    assert.equal(repeated.status, 201);
+    assert.deepEqual(repeated.body, original.body);
+    assert.equal(database.account.balance, "1625.00");
+    assert.equal(database.transactions.length, 1);
+  } finally {
+    await restartedApi.close();
+  }
+});
+
+test("reusing an idempotency key with different parameters is rejected", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const first = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "parameter-check-3"
+    );
+    const reused = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 200 },
+      "parameter-check-3"
+    );
+    assert.equal(first.status, 201);
+    assert.equal(reused.status, 409);
+    assert.equal(reused.body.transaction, undefined);
+    assert.equal(database.account.balance, "1600.00");
+    assert.equal(database.transactions.length, 1);
+  });
+});
+
+test("idempotency keys are scoped by operation and authenticated user", async () => {
+  const database = new FakePool();
+  const api = await startApi(database);
+  try {
+    const deposit = await post(
+      api.baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "scoped-request-6"
+    );
+    const withdrawal = await post(
+      api.baseUrl,
+      "/withdraw",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "scoped-request-6"
+    );
+    assert.equal(deposit.status, 201);
+    assert.equal(withdrawal.status, 201);
+  } finally {
+    await api.close();
+  }
+
+  const otherUserApi = await startApi(database, undefined, { userId: 42 });
+  try {
+    const otherUser = await post(
+      otherUserApi.baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "scoped-request-6"
+    );
+    assert.equal(otherUser.status, 201);
+    assert.equal(database.transactions.length, 3);
+    assert.equal(database.idempotencyRecords.size, 3);
+  } finally {
+    await otherUserApi.close();
+  }
+});
+
+test("malformed idempotency keys are rejected before opening a database transaction", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const whitespace = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "invalid key"
+    );
+    const tooLong = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "k".repeat(129)
+    );
+    assert.equal(whitespace.status, 400);
+    assert.equal(tooLong.status, 400);
+    assert.equal(database.transactionLifecycle.begins, 0);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
+test("failed idempotent operations roll back the reservation with the balance update", async () => {
+  const database = new FakePool({ failInsert: true });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "rollback-request-4"
+    );
+    assert.equal(result.status, 500);
+    assert.equal(result.body.transaction, undefined);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.idempotencyRecords.size, 0);
+  });
+});
+
+test("lock timeouts return a retry-safe error without applying a transaction", async () => {
+  const database = new FakePool({ failAccountLock: true });
+  await withApi(database, async (baseUrl) => {
+    const result = await post(
+      baseUrl,
+      "/deposit",
+      { accountNumber: ACCOUNT_NUMBER, amount: 100 },
+      "lock-timeout-request-5"
+    );
+    assert.equal(result.status, 503);
+    assert.equal(result.body.transaction, undefined);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.idempotencyRecords.size, 0);
+    assert.equal(database.transactionLifecycle.rollbacks, 1);
+    assert.equal(database.transactionLifecycle.releases, 1);
   });
 });
 

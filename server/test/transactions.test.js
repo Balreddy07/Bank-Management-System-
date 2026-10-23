@@ -31,6 +31,7 @@ class FakePool {
       status,
     };
     this.transactions = [];
+    this.historyQuery = null;
     this.idempotencyRecords = new Map();
     this.failInsert = failInsert;
     this.failCommit = failCommit;
@@ -245,9 +246,14 @@ class FakePool {
     }
 
     if (sql.includes("FROM transactions") && sql.includes("account_id = (")) {
+      this.historyQuery = { sql, params };
       return [[...this.transactions]
         .filter((item) => item.account_id === this.account.account_id)
-        .reverse()
+        .sort((left, right) => {
+          const timeDifference = new Date(right.created_at) - new Date(left.created_at);
+          return timeDifference || right.transaction_ref.localeCompare(left.transaction_ref);
+        })
+        .slice(0, 50)
         .map((item) => this.toApiTransaction(item))];
     }
 
@@ -1296,6 +1302,37 @@ test("history returns the stored transaction records", async () => {
     assert.equal(result.account.balance, "1500.00");
     assert.equal(result.transactions.length, 1);
     assert.equal(result.transactions[0].transactionRef, database.transactions[0].transaction_ref);
+    assert.equal(result.transactions[0].type, "DEPOSIT");
+    assert.equal(result.transactions[0].amount, "500.00");
+    assert.equal(result.transactions[0].balanceAfter, "2000.00");
+    assert.equal(result.transactions[0].createdAt, "2026-01-02T03:04:05.000Z");
+  });
+});
+
+test("history is ordered newest first with stable ties and limited to the latest 50 records", async () => {
+  const database = new FakePool();
+  for (let sequence = 1; sequence <= 55; sequence += 1) {
+    database.transactions.push({
+      transaction_ref: `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+      account_id: 1,
+      transaction_type: "DEPOSIT",
+      amount: "1.00",
+      balance_after: "1501.00",
+      created_at: new Date(Date.UTC(2026, 0, 2, 3, 4, sequence === 54 ? 55 : sequence)),
+    });
+  }
+
+  await withApi(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(result.transactions.length, 50);
+    assert.equal(result.transactions[0].transactionRef.endsWith("000000000055"), true);
+    assert.equal(result.transactions[1].transactionRef.endsWith("000000000054"), true);
+    assert.equal(result.transactions.at(-1).transactionRef.endsWith("000000000006"), true);
+    assert.match(database.historyQuery.sql, /ORDER BY created_at DESC,\s*transaction_ref DESC\s+LIMIT 50/);
+    assert.deepEqual(database.historyQuery.params, [ACCOUNT_NUMBER, null, null]);
   });
 });
 

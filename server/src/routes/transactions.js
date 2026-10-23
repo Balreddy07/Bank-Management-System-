@@ -87,7 +87,7 @@ function createTransactionRouter(
            WHERE account_number = ?
              AND (? IS NULL OR customer_id = ?)
          )
-         ORDER BY created_at DESC
+         ORDER BY created_at DESC, transaction_ref DESC
          LIMIT 50`,
         [accountNumber, customerId, customerId]
       );

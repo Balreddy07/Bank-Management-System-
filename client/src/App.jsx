@@ -77,6 +77,7 @@ export default function App() {
   const [staff, setStaff] = useState([]);
   const [staffLoading, setStaffLoading] = useState(false);
   const [staffForm, setStaffForm] = useState({ username: "", password: "", role: "STAFF" });
+  const [customerUserForm, setCustomerUserForm] = useState({ customerId: "", username: "", password: "" });
 
   async function apiFetch(path, options = {}) {
     const response = await fetch(`${API}${path}`, {
@@ -105,6 +106,7 @@ export default function App() {
     setReportData(null);
     setStaff([]);
     setStaffForm({ username: "", password: "", role: "STAFF" });
+    setCustomerUserForm({ customerId: "", username: "", password: "" });
     setCreatedAccount(null);
     setTransactionResult(null);
     setForm(initialForm);
@@ -120,7 +122,7 @@ export default function App() {
         setCurrentUser(data.user);
         setAuthStatus(data.user ? "signed-in" : "signed-out");
         setSessionExpired(Boolean(data.sessionExpired));
-        if (data.user?.role === "STAFF") setActiveTab("Accounts");
+        if (data.user?.role !== "ADMIN" && data.user) setActiveTab("Accounts");
       })
       .catch((error) => {
         if (!cancelled) {
@@ -300,7 +302,7 @@ export default function App() {
   }, [activeTab, authStatus, currentUser]);
 
   function navigate(page) {
-    if (currentUser?.role === "STAFF" && !["Accounts", "Transactions"].includes(page)) {
+    if (currentUser?.role !== "ADMIN" && !["Accounts", "Transactions"].includes(page)) {
       page = "Accounts";
     }
     setActiveTab(page);
@@ -507,6 +509,27 @@ export default function App() {
     }
   }
 
+  async function createCustomerUser(event) {
+    event.preventDefault();
+    setNotice(null);
+    try {
+      const response = await apiFetch("/admin/customer-users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...customerUserForm,
+          customerId: Number(customerUserForm.customerId),
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Could not create customer sign-in.");
+      setNotice({ type: "success", text: data.message });
+      setCustomerUserForm({ customerId: "", username: "", password: "" });
+    } catch (error) {
+      setNotice({ type: "error", text: error.message });
+    }
+  }
+
   async function viewAccount(accountNumber) {
     setAccountDetails(null);
     setEditingAccount(false);
@@ -669,7 +692,7 @@ export default function App() {
           </div>
 
           <div className="profile">
-            <div className="avatar">AD</div>
+            <div className="avatar">{currentUser.username.slice(0, 2).toUpperCase()}</div>
             <div className="profile-info">
               <strong>{currentUser.username}</strong>
               <small>{currentUser.role}</small>
@@ -713,14 +736,16 @@ export default function App() {
           {activeTab === "Accounts" && (
             <section>
               <PageHeading
-                eyebrow="CUSTOMER MANAGEMENT"
+                eyebrow={currentUser.role === "CUSTOMER" ? "MY BANKING" : "CUSTOMER MANAGEMENT"}
                 title="Accounts"
-                description="Register customers, create bank accounts, and search existing records."
+                description={currentUser.role === "CUSTOMER"
+                  ? "View your account details and current balance."
+                  : "Register customers, create bank accounts, and search existing records."}
               />
 
               {notice && <Notice notice={notice} />}
 
-              {createdAccount && (
+              {createdAccount && currentUser.role !== "CUSTOMER" && (
                 <div className="created-card">
                   <div className="created-icon">✓</div>
                   <div className="created-copy">
@@ -749,6 +774,7 @@ export default function App() {
                 </div>
               )}
 
+              {currentUser.role !== "CUSTOMER" && (
               <form className="form-card" onSubmit={createAccount}>
                 <div className="form-card-heading">
                   <div className="form-heading-icon">♙</div>
@@ -882,6 +908,7 @@ export default function App() {
                   </button>
                 </div>
               </form>
+              )}
 
               <div className="directory-heading">
                 <div>
@@ -939,7 +966,7 @@ export default function App() {
                                 </span>
                                 <span>
                                   <strong>{account.fullName}</strong>
-                                  <small>ID: {account.customerId}</small>
+                                  {currentUser.role !== "CUSTOMER" && <small>ID: {account.customerId}</small>}
                                 </span>
                               </div>
                             </td>
@@ -964,15 +991,17 @@ export default function App() {
                                   onClick={() => viewAccount(account.accountNumber)}
                                   aria-label={`View account ${account.accountNumber}`}
                                 >View</button>
-                                <button
-                                  className="table-action"
-                                  type="button"
-                                  onClick={async () => {
-                                    const details = await viewAccount(account.accountNumber);
-                                    if (details) beginAccountEdit(details);
-                                  }}
-                                  aria-label={`Edit customer details for ${account.accountNumber}`}
-                                >Edit</button>
+                                {currentUser.role !== "CUSTOMER" && (
+                                  <button
+                                    className="table-action"
+                                    type="button"
+                                    onClick={async () => {
+                                      const details = await viewAccount(account.accountNumber);
+                                      if (details) beginAccountEdit(details);
+                                    }}
+                                    aria-label={`Edit customer details for ${account.accountNumber}`}
+                                  >Edit</button>
+                                )}
                                 <button
                                   className="table-action"
                                   type="button"
@@ -982,8 +1011,8 @@ export default function App() {
                                     navigate("Transactions");
                                   }}
                                   aria-label={`Transact on account ${account.accountNumber}`}
-                                >Transact</button>
-                                {account.status === "ACTIVE" && (
+                                >{currentUser.role === "CUSTOMER" ? "Activity" : "Transact"}</button>
+                                {currentUser.role !== "CUSTOMER" && account.status === "ACTIVE" && (
                                   <button
                                     className="table-action table-action-danger"
                                     type="button"
@@ -1013,7 +1042,7 @@ export default function App() {
                       setEditingAccount(false);
                     }}>Close</button>
                   </div>
-                  {editingAccount ? (
+                  {editingAccount && currentUser.role !== "CUSTOMER" ? (
                     <form onSubmit={saveAccountEdit}>
                       <div className="form-grid">
                         <FormField label="Full name" required>
@@ -1052,7 +1081,7 @@ export default function App() {
                   ) : (
                     <div className="created-details">
                       <span>Customer</span><strong>{accountDetails.fullName}</strong>
-                      <span>Customer ID</span><strong>{accountDetails.customerId}</strong>
+                      {currentUser.role !== "CUSTOMER" && <><span>Customer ID</span><strong>{accountDetails.customerId}</strong></>}
                       <span>Address</span><strong>{accountDetails.address}</strong>
                       <span>Phone</span><strong>{accountDetails.phone}</strong>
                       <span>Balance</span><strong>{money(accountDetails.balance)}</strong>
@@ -1070,7 +1099,9 @@ export default function App() {
               <PageHeading
                 eyebrow="ACCOUNT ACTIVITY"
                 title="Transactions"
-                description="Post deposits and withdrawals against an active account."
+                description={currentUser.role === "CUSTOMER"
+                  ? "Review the recent activity for your account."
+                  : "Post deposits and withdrawals against an active account."}
               />
 
               {notice && <Notice notice={notice} />}
@@ -1096,7 +1127,8 @@ export default function App() {
                 </div>
               )}
 
-              <div className="transaction-layout">
+              <div className={`transaction-layout ${currentUser.role === "CUSTOMER" ? "customer-transaction-layout" : ""}`}>
+                {currentUser.role !== "CUSTOMER" && (
                 <form className="form-card transaction-form" onSubmit={submitTransaction}>
                   <div className="form-card-heading">
                     <div className="form-heading-icon rupee-icon">₹</div>
@@ -1201,12 +1233,15 @@ export default function App() {
                     Transactions are recorded atomically and require an active staff session.
                   </p>
                 </form>
+                )}
 
                 <section className="transaction-history" aria-labelledby="history-title">
                   <div className="directory-heading">
                     <div>
                       <h2 id="history-title">Recent activity</h2>
-                      <p>Latest 50 stored transactions for this account.</p>
+                      <p>{currentUser.role === "CUSTOMER" && selectedAccountNumber
+                        ? `Account ${selectedAccountNumber} · Latest 50 transactions.`
+                        : "Latest 50 stored transactions for this account."}</p>
                     </div>
                     <span className="directory-count">{transactionHistory.length} shown</span>
                   </div>
@@ -1308,9 +1343,54 @@ export default function App() {
               <PageHeading
                 eyebrow="ACCESS CONTROL"
                 title="Administration"
-                description="Create staff accounts and manage assigned roles."
+                description="Provision customer sign-in and manage staff roles."
               />
               {notice && <Notice notice={notice} />}
+              <form className="form-card staff-form" onSubmit={createCustomerUser}>
+                <div className="form-card-heading">
+                  <div className="form-heading-icon">♙</div>
+                  <div>
+                    <h2>Enable customer sign-in</h2>
+                    <p>Provide the customer with their credentials through a secure channel.</p>
+                  </div>
+                </div>
+                <div className="form-grid">
+                  <FormField label="Customer ID" required>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={customerUserForm.customerId}
+                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, customerId: event.target.value }))}
+                      required
+                    />
+                  </FormField>
+                  <FormField label="Username" required>
+                    <input
+                      value={customerUserForm.username}
+                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, username: event.target.value }))}
+                      minLength={3}
+                      maxLength={64}
+                      pattern="[A-Za-z0-9._-]+"
+                      autoComplete="off"
+                      required
+                    />
+                  </FormField>
+                  <FormField label="Initial password" required>
+                    <input
+                      type="password"
+                      value={customerUserForm.password}
+                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, password: event.target.value }))}
+                      minLength={12}
+                      maxLength={72}
+                      autoComplete="new-password"
+                      required
+                    />
+                    <small className="field-hint">At least 12 characters, no more than 72 bytes.</small>
+                  </FormField>
+                  <button className="primary-button staff-create-button" type="submit">Create customer sign-in</button>
+                </div>
+              </form>
               <form className="form-card staff-form" onSubmit={createStaff}>
                 <div className="form-card-heading">
                   <div className="form-heading-icon">＋</div>
@@ -1553,9 +1633,9 @@ function LoginScreen({ onSubmit, loading, error, expired }) {
           </span>
         </button>
         <div className="login-aside-copy">
-          <span className="eyebrow">STAFF ACCESS</span>
+          <span className="eyebrow">BANKING ACCESS</span>
           <h1>Bank operations, securely.</h1>
-          <p>Sign in with your assigned staff credentials to continue.</p>
+          <p>Sign in with the credentials provided by your bank administrator.</p>
         </div>
         <span className="login-aside-foot">LOCAL DEVELOPMENT · AUTHENTICATED ACCESS</span>
       </section>

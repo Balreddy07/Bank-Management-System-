@@ -4,7 +4,7 @@ Start the API from this directory with `npm run dev` for development or `npm sta
 
 ## Authentication setup
 
-Authentication uses bcrypt password hashes, HTTP-only `SameSite=Lax` session cookies, and a MySQL-backed `user_sessions` table. Run `npm run migrate` to add `staff_users` and `user_sessions`; both use `CREATE TABLE IF NOT EXISTS` and do not alter banking data. The session table is additive and is not stored in process memory.
+Authentication uses bcrypt password hashes, HTTP-only `SameSite=Lax` session cookies, and a MySQL-backed `user_sessions` table. Run `npm run migrate` to add `staff_users`, `user_sessions`, and the additive `customer_users` credential table; these migrations use `CREATE TABLE IF NOT EXISTS` and do not alter banking data. The session table is additive and is not stored in process memory.
 
 Set `SESSION_SECRET` to a randomly generated value of at least 32 characters. `SESSION_COOKIE_SECURE=true` is required when serving over HTTPS; it defaults to secure cookies in production mode. `SESSION_COOKIE_SAME_SITE` may be `lax`, `strict`, or `none`; `none` requires secure cookies. Set `CORS_ORIGINS` to exact trusted frontend origins for a split-origin deployment, and set the frontend build variable `VITE_API_BASE` to its API base URL. The default Vite proxy keeps local requests same-origin. Login requests are additionally limited to 20 per IP per 15 minutes using the rate limiter's default process-local store.
 
@@ -19,7 +19,7 @@ Remove-Item Env:INITIAL_ADMIN_USERNAME, Env:INITIAL_ADMIN_PASSWORD
 Remove-Variable securePassword
 ```
 
-Use a unique password of at least 12 characters and no more than 72 UTF-8 bytes. The command takes a MySQL advisory lock, refuses to create another admin if any administrator row exists, and never logs the password. There is no public registration endpoint. Administrators can create staff and admin accounts in the Administration page.
+Use a unique password of at least 12 characters and no more than 72 UTF-8 bytes. The command takes a MySQL advisory lock, refuses to create another admin if any administrator row exists, and never logs the password. There is no public registration endpoint. Administrators can create staff/admin accounts and provision customer sign-in for existing customers in the Administration page.
 
 To recover an existing administrator locally, run this separate interactive command from the `server` directory:
 
@@ -31,7 +31,15 @@ Enter the exact existing administrator username, type the displayed `RESET <user
 
 ## Transactions
 
-Banking endpoints require an authenticated session and an allowed staff role. The only supported roles are `ADMIN` and `STAFF`: both may open, search, view, edit, deactivate, deposit to, withdraw from, and view history for bank accounts; only `ADMIN` may access reports or `/api/admin/*` staff-management operations. Account and transaction routes reject missing or unrecognized roles. No customer login or customer-to-account ownership mapping exists in this application, so customers cannot authenticate to these endpoints and account-level customer self-service/ownership checks are not supported.
+## Roles and permissions
+
+The supported roles are `ADMIN`, `STAFF`, and `CUSTOMER`. Every banking API request requires a session whose role is resolved from the database:
+
+- `ADMIN` and `STAFF` may open, search, view, edit, and deactivate accounts; post deposits and withdrawals; and view transaction history. Only `ADMIN` may view reports or use `/api/admin/*` staff/customer credential management operations.
+- `CUSTOMER` credentials are provisioned by an administrator for an existing customer; there is no public registration. Customers may list, view, and search only accounts associated with their authenticated customer identity, and view transaction history/receipts for those owned accounts. Customers cannot open or edit accounts, deactivate accounts, post deposits/withdrawals, view reports, or use administrative endpoints.
+- Protected routes deny requests with missing or unrecognized roles. Ownership is resolved from the database-backed session identity, not a customer ID supplied by the client. Requests for another customer's account or receipt return the same not-found response as an unknown record.
+
+Run `npm run migrate` before enabling customer login. The banking `customers` and `accounts` table definitions are not included in this repository; the `customer_users.customer_id` column uses the repository's `BIGINT UNSIGNED` convention but is not a foreign key. Verify its type is compatible with the deployed `customers.customer_id` before applying migrations. Administrators should transmit provisioned customer credentials through a secure channel.
 
 - `POST /api/transactions/deposit` with `{ "accountNumber": "7811288401", "amount": 250.50 }`
 - `POST /api/transactions/withdraw` with `{ "accountNumber": "7811288401", "amount": 250.50 }`
@@ -60,6 +68,7 @@ Reports include deposits, withdrawals, and transaction count for the requested d
 - `PATCH /api/accounts/:accountNumber/deactivate` with `{ "confirm": true }` to deactivate an account (staff and administrators)
 - `GET /api/admin/staff` to list staff without password hashes
 - `POST /api/admin/staff` with `{ "username": "staff.user", "password": "at-least-12-chars", "role": "STAFF" }`
+- `POST /api/admin/customer-users` with `{ "customerId": 42, "username": "customer.user", "password": "at-least-12-chars" }` to provision sign-in for an existing customer
 - `PATCH /api/admin/staff/:userId/role` with `{ "role": "ADMIN" }` or `{ "role": "STAFF" }`
 - `PATCH /api/admin/accounts/:accountNumber/deactivate` with `{ "confirm": true }` (administrator-compatible route)
 

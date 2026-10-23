@@ -1,5 +1,6 @@
 const express = require("express");
 const { createHash, randomUUID } = require("node:crypto");
+const { requireRole } = require("../auth/middleware");
 const pool = require("../db");
 
 const MAX_BALANCE_CENTS = 999999999999n;
@@ -46,10 +47,10 @@ function createTransactionRouter(
 ) {
   const router = express.Router();
 
-  router.post("/deposit", (req, res) =>
+  router.post("/deposit", requireRole("ADMIN", "STAFF"), (req, res) =>
     processBalanceChange(req, res, "DEPOSIT", databasePool, transactionReferenceGenerator)
   );
-  router.post("/withdraw", (req, res) =>
+  router.post("/withdraw", requireRole("ADMIN", "STAFF"), (req, res) =>
     processBalanceChange(req, res, "WITHDRAWAL", databasePool, transactionReferenceGenerator)
   );
 
@@ -60,11 +61,13 @@ function createTransactionRouter(
     }
 
     try {
+      const customerId = req.user?.role === "CUSTOMER" ? req.user.customerId : null;
       const [accounts] = await databasePool.execute(
         `SELECT account_number AS accountNumber, balance, status
          FROM accounts
-         WHERE account_number = ?`,
-        [accountNumber]
+         WHERE account_number = ?
+           AND (? IS NULL OR customer_id = ?)`,
+        [accountNumber, customerId, customerId]
       );
 
       if (accounts.length === 0) {
@@ -79,11 +82,14 @@ function createTransactionRouter(
                 created_at AS createdAt
          FROM transactions
          WHERE account_id = (
-           SELECT account_id FROM accounts WHERE account_number = ?
+           SELECT account_id
+           FROM accounts
+           WHERE account_number = ?
+             AND (? IS NULL OR customer_id = ?)
          )
          ORDER BY created_at DESC
          LIMIT 50`,
-        [accountNumber]
+        [accountNumber, customerId, customerId]
       );
 
       return res.status(200).json({ account: accounts[0], transactions });
@@ -100,6 +106,7 @@ function createTransactionRouter(
     }
 
     try {
+      const customerId = req.user?.role === "CUSTOMER" ? req.user.customerId : null;
       const [transactions] = await databasePool.execute(
         `SELECT t.transaction_ref AS transactionRef,
                 a.account_number AS accountNumber,
@@ -109,8 +116,9 @@ function createTransactionRouter(
                 t.created_at AS createdAt
          FROM transactions t
          INNER JOIN accounts a ON a.account_id = t.account_id
-         WHERE t.transaction_ref = ?`,
-        [transactionRef]
+         WHERE t.transaction_ref = ?
+           AND (? IS NULL OR a.customer_id = ?)`,
+        [transactionRef, customerId, customerId]
       );
 
       if (transactions.length === 0) {

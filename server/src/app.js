@@ -104,8 +104,18 @@ function createApp({
 
   const { requireAuth } = createAuthMiddleware(databasePool);
   app.use("/api/admin", requireAuth, requireRole("ADMIN"), createAdminRouter({ databasePool }));
-  app.use("/api/accounts", requireAuth, requireRole("ADMIN", "STAFF"), createAccountRouter(databasePool));
-  app.use("/api/transactions", requireAuth, requireRole("ADMIN", "STAFF"), createTransactionRouter(databasePool));
+  app.use(
+    "/api/accounts",
+    requireAuth,
+    requireRole("ADMIN", "STAFF", "CUSTOMER"),
+    createAccountRouter(databasePool)
+  );
+  app.use(
+    "/api/transactions",
+    requireAuth,
+    requireRole("ADMIN", "STAFF", "CUSTOMER"),
+    createTransactionRouter(databasePool)
+  );
   app.use("/api/reports", requireAuth, requireRole("ADMIN"), createReportRouter(databasePool));
 
   app.use("/api", (req, res) => {

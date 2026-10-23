@@ -1,6 +1,7 @@
 
 const express = require("express");
 const { randomInt, randomUUID } = require("node:crypto");
+const { requireRole } = require("../auth/middleware");
 const pool = require("../db");
 
 function generateAccountNumber() {
@@ -77,8 +78,13 @@ function createAccountRouter(databasePool = pool) {
                 c.phone
          FROM accounts a
          INNER JOIN customers c ON c.customer_id = a.customer_id
-         WHERE a.account_number = ?`,
-        [accountNumber]
+         WHERE a.account_number = ?
+           AND (? IS NULL OR c.customer_id = ?)`,
+        [
+          accountNumber,
+          req.user?.role === "CUSTOMER" ? req.user.customerId : null,
+          req.user?.role === "CUSTOMER" ? req.user.customerId : null,
+        ]
       );
       if (!accounts.length) return res.status(404).json({ message: "Account not found." });
       return res.status(200).json({ account: accounts[0] });
@@ -116,21 +122,28 @@ function createAccountRouter(databasePool = pool) {
        WHERE (? = ''
           OR a.account_number LIKE ?
           OR c.full_name LIKE ?)
+         AND (? IS NULL OR c.customer_id = ?)
        ORDER BY a.created_at DESC
        LIMIT 100`,
-      [search, searchPattern, searchPattern]
+      [
+        search,
+        searchPattern,
+        searchPattern,
+        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
+        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
+      ]
     );
 
     return res.status(200).json({ accounts });
   } catch (error) {
-    console.error("Account listing failed:", error.message);
+    console.error("Account listing failed:", error.code || "unknown error");
     return res.status(500).json({
       message: "Unable to retrieve accounts.",
     });
   }
 });
 
-router.patch("/:accountNumber", async (req, res) => {
+router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const { accountNumber } = req.params;
   if (!/^\d{10}$/.test(accountNumber)) {
     return res.status(400).json({ message: "Enter a valid 10-digit account number." });
@@ -202,9 +215,13 @@ router.patch("/:accountNumber", async (req, res) => {
   }
 });
 
-router.patch("/:accountNumber/deactivate", createDeactivateAccountHandler(databasePool));
+router.patch(
+  "/:accountNumber/deactivate",
+  requireRole("ADMIN", "STAFF"),
+  createDeactivateAccountHandler(databasePool)
+);
 
-router.post("/", async (req, res) => {
+router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const {
     fullName,
     address,
@@ -380,7 +397,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    console.error("Account creation failed:", error.message);
+    console.error("Account creation failed:", error.code || "unknown error");
 
     return res.status(500).json({
       message: "Account creation failed. Please try again.",

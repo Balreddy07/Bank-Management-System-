@@ -45,6 +45,59 @@ function createAdminRouter({ databasePool }) {
     }
   });
 
+  router.post("/customer-users", async (req, res) => {
+    const customerId = Number(req.body?.customerId);
+    const username = typeof req.body?.username === "string"
+      ? req.body.username.trim().toLowerCase()
+      : "";
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    if (
+      !Number.isSafeInteger(customerId) ||
+      customerId < 1 ||
+      !USERNAME_PATTERN.test(username) ||
+      password.length < 12 ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        message: "Provide a valid customer ID, username, and password of at least 12 characters and at most 72 bytes.",
+      });
+    }
+
+    try {
+      const [customers] = await databasePool.execute(
+        "SELECT customer_id FROM customers WHERE customer_id = ?",
+        [customerId]
+      );
+      if (!customers.length) {
+        return res.status(404).json({ message: "Customer not found." });
+      }
+      const [staffUsers] = await databasePool.execute(
+        "SELECT user_id FROM staff_users WHERE username = ?",
+        [username]
+      );
+      if (staffUsers.length) {
+        return res.status(409).json({ message: "That username is already in use." });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 12);
+      await databasePool.execute(
+        `INSERT INTO customer_users (customer_id, username, password_hash)
+         VALUES (?, ?, ?)`,
+        [customerId, username, passwordHash]
+      );
+      return res.status(201).json({
+        message: "Customer sign-in created.",
+        customer: { customerId, username, role: "CUSTOMER" },
+      });
+    } catch (error) {
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ message: "A customer sign-in or username already exists." });
+      }
+      console.error("Customer sign-in creation failed:", error.code || "unknown error");
+      return res.status(500).json({ message: "Unable to create customer sign-in." });
+    }
+  });
+
   router.patch("/staff/:userId/role", async (req, res) => {
     const userId = Number(req.params.userId);
     const { role } = req.body || {};

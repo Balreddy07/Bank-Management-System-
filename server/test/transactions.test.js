@@ -23,6 +23,15 @@ class FakePool {
     hideTransactionReceipt = false,
     duplicateTransactionRefs = [],
     duplicateKeyName = "uq_transactions_transaction_ref",
+    reportSummary = {
+      transactionCount: 4,
+      totalDeposits: "1500.00",
+      totalWithdrawals: "250.00",
+    },
+    reportAccountSummary = {
+      activeAccountCount: 3,
+      totalBalance: "6250.00",
+    },
   } = {}) {
     this.account = {
       account_id: 1,
@@ -40,6 +49,10 @@ class FakePool {
     this.hideTransactionReceipt = hideTransactionReceipt;
     this.duplicateTransactionRefs = new Set(duplicateTransactionRefs);
     this.duplicateKeyName = duplicateKeyName;
+    this.reportSummary = reportSummary;
+    this.reportAccountSummary = reportAccountSummary;
+    this.reportQuery = null;
+    this.reportAccountQuery = null;
     this.lockTail = Promise.resolve();
     this.transactionLifecycle = {
       begins: 0,
@@ -224,16 +237,13 @@ class FakePool {
     }
 
     if (sql.includes("transactionCount")) {
-      assert.deepEqual(params, ["2026-01-01", "2026-01-31"]);
-      return [[{
-        transactionCount: 4,
-        totalDeposits: "1500.00",
-        totalWithdrawals: "250.00",
-      }]];
+      this.reportQuery = { sql, params };
+      return [[this.reportSummary]];
     }
 
     if (sql.includes("activeAccountCount")) {
-      return [[{ activeAccountCount: 3, totalBalance: "6250.00" }]];
+      this.reportAccountQuery = { sql, params };
+      return [[this.reportAccountSummary]];
     }
 
     if (sql.includes("SELECT account_number AS accountNumber, balance, status")) {
@@ -1648,7 +1658,7 @@ test("lock timeouts return a retry-safe error without applying a transaction", a
   });
 });
 
-test("reports return database totals for a valid date range", async () => {
+test("reports return transaction totals and the current active account count", async () => {
   const database = new FakePool();
   await withApi(database, async (baseUrl) => {
     const response = await fetch(
@@ -1656,21 +1666,77 @@ test("reports return database totals for a valid date range", async () => {
     );
     const result = await response.json();
     assert.equal(response.status, 200);
+    assert.equal(result.startDate, "2026-01-01");
+    assert.equal(result.endDate, "2026-01-31");
     assert.equal(result.transactionCount, 4);
     assert.equal(result.totalDeposits, "1500.00");
+    assert.equal(result.totalWithdrawals, "250.00");
     assert.equal(result.activeAccountCount, 3);
     assert.equal(result.totalBalance, "6250.00");
+    assert.match(database.reportQuery.sql, /created_at >= \?/);
+    assert.match(database.reportQuery.sql, /created_at < DATE_ADD\(\?, INTERVAL 1 DAY\)/);
+    assert.deepEqual(database.reportQuery.params, ["2026-01-01", "2026-01-31"]);
+    assert.match(database.reportAccountQuery.sql, /WHERE status = 'ACTIVE'/);
+    assert.equal(database.reportAccountQuery.params, undefined);
   });
 });
 
-test("reports reject invalid and overlong date ranges", async () => {
+test("reports include both selected dates for same-day and multi-day ranges", async () => {
   const database = new FakePool();
   await withApi(database, async (baseUrl) => {
     const reportsUrl = baseUrl.replace("/api/transactions", "/api/reports");
-    const invalid = await fetch(`${reportsUrl}?startDate=2026-02-30&endDate=2026-03-01`);
-    const tooLong = await fetch(`${reportsUrl}?startDate=2025-01-01&endDate=2026-01-03`);
-    assert.equal(invalid.status, 400);
-    assert.equal(tooLong.status, 400);
+    const sameDay = await fetch(`${reportsUrl}?startDate=2026-01-31&endDate=2026-01-31`);
+    assert.equal(sameDay.status, 200);
+    assert.deepEqual(database.reportQuery.params, ["2026-01-31", "2026-01-31"]);
+    assert.match(database.reportQuery.sql, /created_at < DATE_ADD\(\?, INTERVAL 1 DAY\)/);
+
+    const multiDay = await fetch(`${reportsUrl}?startDate=2026-01-30&endDate=2026-02-01`);
+    assert.equal(multiDay.status, 200);
+    assert.deepEqual(database.reportQuery.params, ["2026-01-30", "2026-02-01"]);
+  });
+});
+
+test("empty report ranges return zero transaction totals and the current account count", async () => {
+  const database = new FakePool({
+    reportSummary: {
+      transactionCount: 0,
+      totalDeposits: "0.00",
+      totalWithdrawals: "0.00",
+    },
+  });
+  await withApi(database, async (baseUrl) => {
+    const response = await fetch(
+      `${baseUrl.replace("/api/transactions", "/api/reports")}?startDate=2026-01-01&endDate=2026-01-01`
+    );
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(result.transactionCount, 0);
+    assert.equal(result.totalDeposits, "0.00");
+    assert.equal(result.totalWithdrawals, "0.00");
+    assert.equal(result.activeAccountCount, 3);
+  });
+});
+
+test("reports reject missing, malformed, reversed, and overlong date ranges before querying", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const reportsUrl = baseUrl.replace("/api/transactions", "/api/reports");
+    const invalidRanges = [
+      ["", "Provide a valid start and end date, with startDate no later than endDate."],
+      ["?startDate=2026-02-30&endDate=2026-03-01", "Provide a valid start and end date, with startDate no later than endDate."],
+      ["?startDate=2026-03-02&endDate=2026-03-01", "Provide a valid start and end date, with startDate no later than endDate."],
+      ["?startDate=2025-01-01&endDate=2026-01-03", "Report date range cannot exceed 367 days."],
+      ["?startDate=2026-01-01&endDate=", "Provide a valid start and end date, with startDate no later than endDate."],
+    ];
+
+    for (const [query, message] of invalidRanges) {
+      const response = await fetch(`${reportsUrl}${query}`);
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).message, message);
+    }
+    assert.equal(database.reportQuery, null);
+    assert.equal(database.reportAccountQuery, null);
   });
 });
 

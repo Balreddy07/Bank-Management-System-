@@ -48,6 +48,7 @@ Run `npm run migrate` before enabling customer login. The banking `customers` an
 - `GET /api/reports?startDate=2026-10-01&endDate=2026-10-22`
 
 Amounts must be positive, have at most two decimal places, and fit the existing database monetary range. Withdrawals preserve a minimum balance of ₹1,000.00. Balance changes and transaction records are committed together.
+Transaction history is returned newest first, with transaction reference as a stable tie-breaker, and is bounded to the latest 50 records. Customer history and receipts are restricted to accounts owned by the authenticated customer.
 
 Successful deposits and withdrawals return a receipt containing `transactionRef`, `createdAt`, `type`, `amount`, and `balanceAfter`. The reference is generated as a UUID, stored with the transaction, and returned only after the balance and transaction record have committed. A detected reference collision is retried a bounded number of times; other database errors roll back the balance change.
 

@@ -17,6 +17,7 @@ class FakePool {
     balance = "1500.00",
     status = "ACTIVE",
     failInsert = false,
+    failCommit = false,
     failDuplicateInsert = false,
     hideTransactionReceipt = false,
     duplicateTransactionRefs = [],
@@ -30,11 +31,18 @@ class FakePool {
     };
     this.transactions = [];
     this.failInsert = failInsert;
+    this.failCommit = failCommit;
     this.failDuplicateInsert = failDuplicateInsert;
     this.hideTransactionReceipt = hideTransactionReceipt;
     this.duplicateTransactionRefs = new Set(duplicateTransactionRefs);
     this.duplicateKeyName = duplicateKeyName;
     this.lockTail = Promise.resolve();
+    this.transactionLifecycle = {
+      begins: 0,
+      commits: 0,
+      rollbacks: 0,
+      releases: 0,
+    };
   }
 
   async acquireLock() {
@@ -55,6 +63,7 @@ class FakePool {
 
     return {
       async beginTransaction() {
+        database.transactionLifecycle.begins += 1;
         unlock = await database.acquireLock();
       },
       async execute(sql, params) {
@@ -128,14 +137,22 @@ class FakePool {
         throw new Error(`Unexpected connection query: ${sql}`);
       },
       async commit() {
+        database.transactionLifecycle.commits += 1;
+        if (database.failCommit) {
+          const error = new Error("simulated commit failure with private-test-marker");
+          error.code = "TEST_COMMIT_FAILURE";
+          throw error;
+        }
         if (stagedBalance !== undefined) database.account.balance = stagedBalance;
         if (stagedTransaction) database.transactions.push(stagedTransaction);
       },
       async rollback() {
+        database.transactionLifecycle.rollbacks += 1;
         stagedBalance = undefined;
         stagedTransaction = undefined;
       },
       release() {
+        database.transactionLifecycle.releases += 1;
         unlock?.();
         unlock = null;
       },
@@ -719,6 +736,9 @@ test("deposit updates the balance and returns a complete transaction receipt", a
     assert.equal(database.transactions[0].transaction_type, "DEPOSIT");
     assert.equal(database.transactions[0].amount, "500.25");
     assert.equal(database.transactions[0].balance_after, "2000.25");
+    assert.equal(database.transactionLifecycle.commits, 1);
+    assert.equal(database.transactionLifecycle.rollbacks, 0);
+    assert.equal(database.transactionLifecycle.releases, 1);
 
     const inquiry = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
     const inquiryResult = await inquiry.json();
@@ -778,6 +798,9 @@ test("withdrawal may leave exactly the minimum balance", async () => {
     assert.equal(database.transactions[0].transaction_type, "WITHDRAWAL");
     assert.equal(database.transactions[0].amount, "1500.00");
     assert.equal(database.transactions[0].balance_after, "1000.00");
+    assert.equal(database.transactionLifecycle.commits, 1);
+    assert.equal(database.transactionLifecycle.rollbacks, 0);
+    assert.equal(database.transactionLifecycle.releases, 1);
 
     const inquiry = await fetch(`${baseUrl}?accountNumber=${ACCOUNT_NUMBER}`);
     const inquiryResult = await inquiry.json();
@@ -997,9 +1020,42 @@ test("failed record insertion rolls back the balance update", async () => {
   await withApi(database, async (baseUrl) => {
     const result = await post(baseUrl, "/deposit", { accountNumber: ACCOUNT_NUMBER, amount: 100 });
     assert.equal(result.status, 500);
+    assert.equal(result.body.transaction, undefined);
     assert.equal(database.account.balance, "1500.00");
     assert.equal(database.transactions.length, 0);
+    assert.equal(database.transactionLifecycle.rollbacks, 1);
+    assert.equal(database.transactionLifecycle.releases, 1);
   });
+});
+
+test("commit failures roll back without returning a receipt or logging database details", async () => {
+  const database = new FakePool({ failCommit: true });
+  const loggedErrors = [];
+  const originalConsoleError = console.error;
+  console.error = (...values) => loggedErrors.push(values.join(" "));
+
+  try {
+    await withApi(database, async (baseUrl) => {
+      const result = await post(baseUrl, "/deposit", {
+        accountNumber: ACCOUNT_NUMBER,
+        amount: 100,
+      });
+      assert.equal(result.status, 500);
+      assert.match(result.body.message, /could not be completed/i);
+      assert.equal(result.body.transaction, undefined);
+      assert.equal(database.account.balance, "1500.00");
+      assert.equal(database.transactions.length, 0);
+      assert.equal(database.transactionLifecycle.begins, 1);
+      assert.equal(database.transactionLifecycle.commits, 1);
+      assert.equal(database.transactionLifecycle.rollbacks, 1);
+      assert.equal(database.transactionLifecycle.releases, 1);
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.ok(loggedErrors.some((message) => message.includes("TEST_COMMIT_FAILURE")));
+  assert.ok(!loggedErrors.join("\n").includes("private-test-marker"));
 });
 
 test("failed receipt lookup rolls back a deposit and does not record a transaction", async () => {

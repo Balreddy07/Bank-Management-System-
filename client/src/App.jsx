@@ -1,5 +1,5 @@
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API = (import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, "");
@@ -52,6 +52,7 @@ export default function App() {
   const [accountEditForm, setAccountEditForm] = useState({ fullName: "", address: "", phone: "" });
   const [accountEditLoading, setAccountEditLoading] = useState(false);
   const [selectedAccountNumber, setSelectedAccountNumber] = useState("");
+  const selectedAccountNumberRef = useRef("");
   const [transactionAccount, setTransactionAccount] = useState(null);
   const [transactionHistory, setTransactionHistory] = useState([]);
   const [transactionHistoryLoading, setTransactionHistoryLoading] = useState(false);
@@ -96,6 +97,8 @@ export default function App() {
     setAccountSearch("");
     setAccountDetails(null);
     setEditingAccount(false);
+    selectedAccountNumberRef.current = "";
+    setSelectedAccountNumber("");
     setTransactionAccount(null);
     setTransactionHistory([]);
     setTransactionAmount("");
@@ -183,11 +186,13 @@ export default function App() {
 
         setAccounts(data.accounts || []);
         if (activeTab === "Transactions") {
-          setSelectedAccountNumber((previous) =>
-            data.accounts?.some((account) => account.accountNumber === previous)
-              ? previous
-              : data.accounts?.[0]?.accountNumber || ""
-          );
+          const next = data.accounts?.some(
+            (account) => account.accountNumber === selectedAccountNumberRef.current
+          )
+            ? selectedAccountNumberRef.current
+            : data.accounts?.[0]?.accountNumber || "";
+          selectedAccountNumberRef.current = next;
+          setSelectedAccountNumber(next);
         }
       } catch (error) {
         if (error.name !== "AbortError") {
@@ -219,6 +224,12 @@ export default function App() {
           signal: controller.signal,
         });
         const data = await response.json();
+        if (
+          controller.signal.aborted ||
+          selectedAccountNumberRef.current !== selectedAccountNumber
+        ) {
+          return;
+        }
         if (!response.ok) throw new Error(data.message || "Could not load transaction history.");
         setTransactionAccount(data.account);
         setTransactionHistory(data.transactions || []);
@@ -411,6 +422,7 @@ export default function App() {
     setNotice(null);
     setTransactionResult(null);
 
+    const accountNumber = selectedAccountNumber;
     if (!selectedAccountNumber || transactionAccount?.status !== "ACTIVE") {
       setNotice({ type: "error", text: "Choose an active account to continue." });
       return;
@@ -435,7 +447,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            accountNumber: selectedAccountNumber,
+            accountNumber,
             amount: Number(transactionAmount),
           }),
         }
@@ -444,19 +456,23 @@ export default function App() {
       if (!response.ok) throw new Error(data.message || "Transaction could not be completed.");
 
       setTransactionResult(data.transaction);
-      setTransactionAccount((previous) => ({
-        ...previous,
-        ...data.account,
-      }));
+      if (selectedAccountNumberRef.current === accountNumber) {
+        setTransactionAccount((previous) => ({
+          ...previous,
+          ...data.account,
+        }));
+      }
       setNotice({ type: "success", text: data.message });
       setTransactionAmount("");
 
-      const params = new URLSearchParams({ accountNumber: selectedAccountNumber });
+      const params = new URLSearchParams({ accountNumber });
       const historyResponse = await apiFetch(`/transactions?${params}`);
       if (historyResponse.ok) {
         const historyData = await historyResponse.json();
-        setTransactionAccount(historyData.account);
-        setTransactionHistory(historyData.transactions || []);
+        if (selectedAccountNumberRef.current === accountNumber) {
+          setTransactionAccount(historyData.account);
+          setTransactionHistory(historyData.transactions || []);
+        }
       }
     } catch (error) {
       setNotice({
@@ -961,6 +977,7 @@ export default function App() {
                                   className="table-action"
                                   type="button"
                                   onClick={() => {
+                                    selectedAccountNumberRef.current = account.accountNumber;
                                     setSelectedAccountNumber(account.accountNumber);
                                     navigate("Transactions");
                                   }}
@@ -1095,7 +1112,9 @@ export default function App() {
                     <select
                       value={selectedAccountNumber}
                       onChange={(event) => {
-                        setSelectedAccountNumber(event.target.value);
+                        const nextAccountNumber = event.target.value;
+                        selectedAccountNumberRef.current = nextAccountNumber;
+                        setSelectedAccountNumber(nextAccountNumber);
                         setTransactionResult(null);
                         setNotice(null);
                       }}

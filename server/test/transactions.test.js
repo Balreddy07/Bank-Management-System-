@@ -17,7 +17,10 @@ class FakePool {
     balance = "1500.00",
     status = "ACTIVE",
     failInsert = false,
+    failDuplicateInsert = false,
     hideTransactionReceipt = false,
+    duplicateTransactionRefs = [],
+    duplicateKeyName = "uq_transactions_transaction_ref",
   } = {}) {
     this.account = {
       account_id: 1,
@@ -27,7 +30,10 @@ class FakePool {
     };
     this.transactions = [];
     this.failInsert = failInsert;
+    this.failDuplicateInsert = failDuplicateInsert;
     this.hideTransactionReceipt = hideTransactionReceipt;
+    this.duplicateTransactionRefs = new Set(duplicateTransactionRefs);
+    this.duplicateKeyName = duplicateKeyName;
     this.lockTail = Promise.resolve();
   }
 
@@ -52,7 +58,7 @@ class FakePool {
         unlock = await database.acquireLock();
       },
       async execute(sql, params) {
-        if (sql.includes("FOR UPDATE")) {
+        if (sql.includes("FROM accounts") && sql.includes("FOR UPDATE")) {
           return [database.account.account_number === params[0] ? [{ ...database.account }] : []];
         }
 
@@ -62,6 +68,18 @@ class FakePool {
         }
 
         if (sql.includes("INSERT INTO transactions")) {
+          if (database.failDuplicateInsert) {
+            const error = new Error("Duplicate entry for key 'uq_other_unique_key'");
+            error.code = "ER_DUP_ENTRY";
+            error.sqlMessage = error.message;
+            throw error;
+          }
+          if (database.duplicateTransactionRefs.has(params[0])) {
+            const error = new Error(`Duplicate entry for key '${database.duplicateKeyName}'`);
+            error.code = "ER_DUP_ENTRY";
+            error.sqlMessage = error.message;
+            throw error;
+          }
           if (database.failInsert) {
             const error = new Error("simulated insert failure");
             error.code = "TEST_INSERT_FAILURE";
@@ -77,6 +95,26 @@ class FakePool {
             created_at: new Date("2026-01-02T03:04:05.000Z"),
           };
           return [{ affectedRows: 1 }];
+        }
+
+        if (
+          sql.includes("SELECT transaction_ref\n") &&
+          sql.includes("FROM transactions") &&
+          sql.includes("FOR UPDATE")
+        ) {
+          return [database.duplicateTransactionRefs.has(params[0])
+            ? [{ transaction_ref: params[0] }]
+            : []];
+        }
+
+        if (sql.includes("INFORMATION_SCHEMA.STATISTICS")) {
+          return [params[0] === database.duplicateKeyName
+            ? [{
+              indexName: database.duplicateKeyName,
+              columnCount: 1,
+              referenceColumnCount: 1,
+            }]
+            : []];
         }
 
         if (sql.includes("WHERE transaction_ref = ?")) {
@@ -566,10 +604,13 @@ class FakeAuthPool {
   }
 }
 
-async function startApi(database) {
+async function startApi(database, transactionReferenceGenerator) {
   const app = express();
   app.use(express.json());
-  app.use("/api/transactions", createTransactionRouter(database));
+  app.use("/api/transactions", createTransactionRouter(
+    database,
+    transactionReferenceGenerator ? { transactionReferenceGenerator } : undefined
+  ));
   app.use("/api/reports", createReportRouter(database));
   const server = app.listen(0);
   await once(server, "listening");
@@ -673,6 +714,7 @@ test("deposit updates the balance and returns a complete transaction receipt", a
     assert.equal(result.body.transaction.amount, "500.25");
     assert.equal(result.body.transaction.balanceAfter, "2000.25");
     assert.ok(result.body.transaction.createdAt);
+    assert.equal(result.body.transaction.transactionRef, database.transactions[0].transaction_ref);
     assert.equal(database.transactions.length, 1);
     assert.equal(database.transactions[0].transaction_type, "DEPOSIT");
     assert.equal(database.transactions[0].amount, "500.25");
@@ -729,6 +771,10 @@ test("withdrawal may leave exactly the minimum balance", async () => {
     assert.equal(result.body.account.balance, "1000.00");
     assert.equal(result.body.transaction.amount, "1500.00");
     assert.equal(result.body.transaction.balanceAfter, "1000.00");
+    assert.equal(result.body.transaction.type, "WITHDRAWAL");
+    assert.ok(result.body.transaction.transactionRef);
+    assert.ok(result.body.transaction.createdAt);
+    assert.equal(result.body.transaction.transactionRef, database.transactions[0].transaction_ref);
     assert.equal(database.transactions[0].transaction_type, "WITHDRAWAL");
     assert.equal(database.transactions[0].amount, "1500.00");
     assert.equal(database.transactions[0].balance_after, "1000.00");
@@ -742,6 +788,102 @@ test("withdrawal may leave exactly the minimum balance", async () => {
       status: "ACTIVE",
     });
   });
+});
+
+test("duplicate transaction references are retried for deposits and withdrawals", async () => {
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const newReference = "00000000-0000-4000-8000-000000000002";
+  for (const [path, amount, expectedType] of [
+    ["/deposit", 100, "DEPOSIT"],
+    ["/withdraw", 100, "WITHDRAWAL"],
+  ]) {
+    const database = new FakePool({
+      balance: "2500.00",
+      duplicateTransactionRefs: [existingReference],
+    });
+    const candidates = [existingReference, newReference];
+    const api = await startApi(database, () => candidates.shift());
+    try {
+      const result = await post(api.baseUrl, path, { accountNumber: ACCOUNT_NUMBER, amount });
+      assert.equal(result.status, 201);
+      assert.equal(result.body.transaction.transactionRef, newReference);
+      assert.equal(result.body.transaction.type, expectedType);
+      assert.equal(database.transactions.length, 1);
+      assert.equal(database.transactions[0].transaction_ref, newReference);
+    } finally {
+      await api.close();
+    }
+  }
+});
+
+test("transaction-reference collisions are bounded and roll back without a receipt", async () => {
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const database = new FakePool({
+    balance: "2500.00",
+    duplicateTransactionRefs: [existingReference],
+  });
+  let generatedCount = 0;
+  const api = await startApi(database, () => {
+    generatedCount += 1;
+    return existingReference;
+  });
+  try {
+    const result = await post(api.baseUrl, "/deposit", {
+      accountNumber: ACCOUNT_NUMBER,
+      amount: 100,
+    });
+    assert.equal(result.status, 500);
+    assert.equal(generatedCount, 5);
+    assert.equal(database.account.balance, "2500.00");
+    assert.equal(database.transactions.length, 0);
+    assert.equal(result.body.transaction, undefined);
+  } finally {
+    await api.close();
+  }
+});
+
+test("duplicate references are rejected by the mocked transaction_ref unique index", async () => {
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const database = new FakePool({
+    duplicateTransactionRefs: [existingReference],
+  });
+  const api = await startApi(database, () => existingReference);
+  try {
+    const result = await post(api.baseUrl, "/deposit", {
+      accountNumber: ACCOUNT_NUMBER,
+      amount: 100,
+    });
+    assert.equal(result.status, 500);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
+test("unrelated duplicate-key errors are not retried as reference collisions", async () => {
+  const existingReference = "00000000-0000-4000-8000-000000000001";
+  const database = new FakePool({
+    failDuplicateInsert: true,
+    duplicateTransactionRefs: [existingReference],
+  });
+  let generatedCount = 0;
+  const api = await startApi(database, () => {
+    generatedCount += 1;
+    return existingReference;
+  });
+  try {
+    const result = await post(api.baseUrl, "/deposit", {
+      accountNumber: ACCOUNT_NUMBER,
+      amount: 100,
+    });
+    assert.equal(result.status, 500);
+    assert.equal(generatedCount, 1);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  } finally {
+    await api.close();
+  }
 });
 
 test("withdrawal may leave more than the minimum balance", async () => {

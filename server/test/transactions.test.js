@@ -1278,7 +1278,7 @@ test("malformed withdrawal JSON is rejected with a client error", async () => {
       body: "{",
     });
     assert.equal(response.status, 400);
-    assert.equal((await response.json()).message, "Invalid JSON request body");
+    assert.equal((await response.json()).message, "Invalid JSON request body.");
   });
 });
 
@@ -1351,6 +1351,9 @@ test("commit failures roll back without returning a receipt or logging database 
       assert.equal(result.status, 500);
       assert.match(result.body.message, /could not be completed/i);
       assert.equal(result.body.transaction, undefined);
+      assert.equal(JSON.stringify(result.body).includes("private-test-marker"), false);
+      assert.equal(JSON.stringify(result.body).includes("TEST_COMMIT_FAILURE"), false);
+      assert.equal(JSON.stringify(result.body).includes("stack"), false);
       assert.equal(database.account.balance, "1500.00");
       assert.equal(database.transactions.length, 0);
       assert.equal(database.transactionLifecycle.begins, 1);
@@ -1374,6 +1377,8 @@ test("failed receipt lookup rolls back a deposit and does not record a transacti
     assert.match(result.body.message, /could not be completed/i);
     assert.equal(database.account.balance, "1500.00");
     assert.equal(database.transactions.length, 0);
+    assert.equal(database.transactionLifecycle.rollbacks, 1);
+    assert.equal(database.transactionLifecycle.releases, 1);
   });
 });
 
@@ -1385,6 +1390,8 @@ test("failed withdrawal record insertion rolls back the balance update", async (
     assert.match(result.body.message, /could not be completed/i);
     assert.equal(database.account.balance, "2500.00");
     assert.equal(database.transactions.length, 0);
+    assert.equal(database.transactionLifecycle.rollbacks, 1);
+    assert.equal(database.transactionLifecycle.releases, 1);
   });
 });
 

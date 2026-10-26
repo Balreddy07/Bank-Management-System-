@@ -51,7 +51,7 @@ function createReportRouter(databasePool = pool) {
         ...accountRows[0],
       });
     } catch (error) {
-      console.error("Report generation failed:", error.code || error.message);
+      console.error("Report generation failed:", error.code || "unknown error");
       return res.status(500).json({ message: "Unable to generate the report." });
     }
   });

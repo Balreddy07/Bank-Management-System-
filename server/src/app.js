@@ -17,6 +17,53 @@ const { createAdminRouter } = require("./routes/admin");
 const DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
 const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
+function createErrorHandler() {
+  return (receivedError, req, res, next) => {
+    const error = receivedError instanceof Error
+      ? receivedError
+      : new Error("Unhandled application failure.");
+    if (res.headersSent) return next(error);
+
+    if (error.type === "entity.too.large") {
+      return res.status(413).json({ message: "Request body is too large." });
+    }
+    if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
+      return res.status(400).json({ message: "Invalid JSON request body." });
+    }
+
+    const statusMessages = {
+      400: "Invalid request. Check the submitted data and try again.",
+      401: "Please sign in to continue.",
+      403: "You do not have permission to perform this action.",
+      404: "The requested resource was not found.",
+      413: "Request body is too large.",
+      415: "Unsupported request content type.",
+      422: "Some submitted information is invalid. Check your input and try again.",
+      429: "Too many requests. Please wait and try again.",
+    };
+    const status = Number(error.status || error.statusCode);
+    if (statusMessages[status]) {
+      return res.status(status).json({ message: statusMessages[status] });
+    }
+
+    const stackFrames = typeof error.stack === "string"
+      ? error.stack.split("\n").slice(1, 6).map((frame) => frame.trim().slice(0, 240))
+      : [];
+    const code = typeof error.code === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(error.code)
+      ? error.code
+      : "UNKNOWN";
+    const name = typeof error.name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name)
+      ? error.name
+      : "Error";
+    console.error("Application error:", {
+      name,
+      code,
+      stackFrames,
+    });
+    return res.status(500).json({ message: "Something went wrong. Please try again." });
+  };
+}
+
 function createSessionStore(databasePool) {
   return new MySQLSessionStore(databasePool);
 }
@@ -127,16 +174,9 @@ function createApp({
     res.status(404).json({ message: "API endpoint not found" });
   });
 
-  app.use((err, req, res, next) => {
-    if (res.headersSent) return next(err);
-    if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
-      return res.status(400).json({ message: "Invalid JSON request body" });
-    }
-    console.error("Application error:", err.code || "unknown error");
-    return res.status(500).json({ message: "Internal server error" });
-  });
+  app.use(createErrorHandler());
 
   return app;
 }
 
-module.exports = { createApp };
+module.exports = { createApp, createErrorHandler };

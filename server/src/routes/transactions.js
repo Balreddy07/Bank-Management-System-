@@ -2,26 +2,16 @@ const express = require("express");
 const { createHash, randomUUID } = require("node:crypto");
 const { requireRole } = require("../auth/middleware");
 const pool = require("../db");
+const {
+  formatMoneyCents,
+  isValidAccountNumber,
+  isValidTransactionReference,
+  parseMoneyCents,
+} = require("../validation");
 
 const MAX_BALANCE_CENTS = 999999999999n;
 const MIN_WITHDRAWAL_BALANCE_CENTS = 100000n;
 const MAX_TRANSACTION_REFERENCE_ATTEMPTS = 5;
-
-function parseMoneyCents(value) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-
-  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(value));
-  if (!match) return null;
-
-  const cents = BigInt(match[1]) * 100n + BigInt((match[2] || "").padEnd(2, "0"));
-  return cents <= MAX_BALANCE_CENTS ? cents : null;
-}
-
-function formatMoneyCents(cents) {
-  return `${cents / 100n}.${String(cents % 100n).padStart(2, "0")}`;
-}
 
 function readStoredMoneyCents(value) {
   const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(value));
@@ -55,8 +45,8 @@ function createTransactionRouter(
   );
 
   router.get("/", async (req, res) => {
-    const accountNumber = String(req.query.accountNumber || "");
-    if (!/^\d{10}$/.test(accountNumber)) {
+    const accountNumber = req.query.accountNumber;
+    if (!isValidAccountNumber(accountNumber)) {
       return res.status(400).json({ message: "Enter a valid 10-digit account number." });
     }
 
@@ -101,7 +91,7 @@ function createTransactionRouter(
 
   router.get("/:transactionRef", async (req, res) => {
     const { transactionRef } = req.params;
-    if (!/^[0-9a-f-]{36}$/i.test(transactionRef)) {
+    if (!isValidTransactionReference(transactionRef)) {
       return res.status(400).json({ message: "Enter a valid transaction reference." });
     }
 
@@ -144,7 +134,7 @@ async function processBalanceChange(
 ) {
   const { accountNumber, amount } = req.body || {};
 
-  if (typeof accountNumber !== "string" || !/^\d{10}$/.test(accountNumber)) {
+  if (!isValidAccountNumber(accountNumber)) {
     return res.status(400).json({ message: "Enter a valid 10-digit account number." });
   }
 

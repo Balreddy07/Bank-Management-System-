@@ -35,6 +35,53 @@ function money(value) {
   }).format(Number(value) || 0);
 }
 
+function safeResponseMessage(message, fallback) {
+  if (typeof message !== "string") return fallback;
+  const text = message.trim();
+  if (
+    !text ||
+    text.length > 300 ||
+    /\b(?:sql(?:state)?|mysql|sqlite|stack trace|unknown column|unknown database|errno|ER_[A-Z0-9_]+|SELECT\s|INSERT\s|UPDATE\s+\w+\s+SET|DELETE\s+FROM|ECONN[A-Z]+|access denied for user|duplicate entry|for key|foreign key constraint|cannot add or update|data too long)\b/i.test(text) ||
+    /table .+ doesn't exist/i.test(text) ||
+    /(?:^|\n)\s*at\s+\S+/i.test(text)
+  ) {
+    return fallback;
+  }
+  return text;
+}
+
+async function readApiResponse(response, fallback = "Something went wrong. Please try again.") {
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    if (!response.ok && response.status >= 500 && response.status !== 503) {
+      throw new Error("Something went wrong on our side. Please try again.");
+    }
+    throw new Error(response.ok
+      ? "The server returned an invalid response. Please try again."
+      : fallback);
+  }
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("The server returned an invalid response. Please try again.");
+  }
+  if (!response.ok) {
+    throw new Error(response.status >= 500 && response.status !== 503
+      ? "Something went wrong on our side. Please try again."
+      : safeResponseMessage(data.message, fallback));
+  }
+  return data;
+}
+
+function getUserErrorMessage(error, fallback = "Something went wrong. Please try again.") {
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message === "Failed to fetch" || /^NetworkError/i.test(message)) {
+    return "The service could not be reached. Check your connection and try again.";
+  }
+  return safeResponseMessage(message, fallback);
+}
+
 export default function App() {
   const [authStatus, setAuthStatus] = useState("checking");
   const [currentUser, setCurrentUser] = useState(null);
@@ -80,10 +127,16 @@ export default function App() {
   const [customerUserForm, setCustomerUserForm] = useState({ customerId: "", username: "", password: "" });
 
   async function apiFetch(path, options = {}) {
-    const response = await fetch(`${API}${path}`, {
-      credentials: "include",
-      ...options,
-    });
+    let response;
+    try {
+      response = await fetch(`${API}${path}`, {
+        credentials: "include",
+        ...options,
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      throw new Error("The service could not be reached. Check your connection and try again.");
+    }
     if (response.status === 401 && !path.startsWith("/auth/")) {
       setCurrentUser(null);
       setAuthStatus("signed-out");
@@ -114,10 +167,9 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API}/auth/session`, { credentials: "include" })
+    apiFetch("/auth/session")
       .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.message || "Authentication service is unavailable.");
+        const data = await readApiResponse(response, "Authentication service is unavailable.");
         if (cancelled) return;
         setCurrentUser(data.user);
         setAuthStatus(data.user ? "signed-in" : "signed-out");
@@ -126,7 +178,7 @@ export default function App() {
       })
       .catch((error) => {
         if (!cancelled) {
-          setAuthError(error.message);
+          setAuthError(getUserErrorMessage(error, "Authentication service is unavailable."));
           setAuthStatus("signed-out");
         }
       });
@@ -139,10 +191,10 @@ export default function App() {
     if (authStatus !== "signed-in" || !currentUser) return;
     let cancelled = false;
 
-    fetch(`${API}/health/db`)
+    apiFetch("/health/db")
       .then((response) => {
         if (!response.ok) throw new Error("Database unavailable");
-        return response.json();
+        return readApiResponse(response, "Database unavailable.");
       })
       .then((data) => {
         if (!cancelled) {
@@ -180,11 +232,7 @@ export default function App() {
           { signal: controller.signal }
         );
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          throw new Error(data.message || "Could not load accounts.");
-        }
+        const data = await readApiResponse(response, "Could not load accounts.");
 
         setAccounts(data.accounts || []);
         if (activeTab === "Transactions") {
@@ -198,7 +246,7 @@ export default function App() {
         }
       } catch (error) {
         if (error.name !== "AbortError") {
-          setNotice({ type: "error", text: error.message });
+          setNotice({ type: "error", text: getUserErrorMessage(error, "Could not load accounts.") });
         }
       } finally {
         if (!controller.signal.aborted) {
@@ -225,21 +273,20 @@ export default function App() {
         const response = await apiFetch(`/transactions?${params}`, {
           signal: controller.signal,
         });
-        const data = await response.json();
+        const data = await readApiResponse(response, "Could not load transaction history.");
         if (
           controller.signal.aborted ||
           selectedAccountNumberRef.current !== selectedAccountNumber
         ) {
           return;
         }
-        if (!response.ok) throw new Error(data.message || "Could not load transaction history.");
         setTransactionAccount(data.account);
         setTransactionHistory(data.transactions || []);
       } catch (error) {
         if (error.name !== "AbortError") {
           setTransactionAccount(null);
           setTransactionHistory([]);
-          setNotice({ type: "error", text: error.message });
+          setNotice({ type: "error", text: getUserErrorMessage(error, "Could not load transaction history.") });
         }
       } finally {
         if (!controller.signal.aborted) setTransactionHistoryLoading(false);
@@ -264,13 +311,12 @@ export default function App() {
         const response = await apiFetch(`/reports?${params}`, {
           signal: controller.signal,
         });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.message || "Could not load report data.");
+        const data = await readApiResponse(response, "Could not load report data.");
         setReportData(data);
       } catch (error) {
         if (error.name !== "AbortError") {
           setReportData(null);
-          setReportError(error.message);
+          setReportError(getUserErrorMessage(error, "Could not load report data."));
         }
       } finally {
         if (!controller.signal.aborted) setReportLoading(false);
@@ -288,11 +334,12 @@ export default function App() {
       setStaffLoading(true);
       try {
         const response = await apiFetch("/admin/staff", { signal: controller.signal });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.message || "Could not load staff accounts.");
+        const data = await readApiResponse(response, "Could not load staff accounts.");
         setStaff(data.staff || []);
       } catch (error) {
-        if (error.name !== "AbortError") setNotice({ type: "error", text: error.message });
+        if (error.name !== "AbortError") {
+          setNotice({ type: "error", text: getUserErrorMessage(error, "Could not load staff accounts.") });
+        }
       } finally {
         if (!controller.signal.aborted) setStaffLoading(false);
       }
@@ -316,26 +363,22 @@ export default function App() {
     setLoginLoading(true);
     setAuthError("");
     try {
-      const response = await fetch(`${API}/auth/login`, {
+      const response = await apiFetch("/auth/login", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           username: event.currentTarget.username.value,
           password: event.currentTarget.password.value,
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Unable to sign in.");
+      const data = await readApiResponse(response, "Unable to sign in.");
       setCurrentUser(data.user);
       setAuthStatus("signed-in");
       setSessionExpired(false);
       clearProtectedData();
       setActiveTab(data.user.role === "ADMIN" ? "Dashboard" : "Accounts");
     } catch (error) {
-      setAuthError(error.message === "Failed to fetch"
-        ? "The authentication service cannot be reached. Check that the API is running."
-        : error.message);
+      setAuthError(getUserErrorMessage(error, "Unable to sign in."));
     } finally {
       setLoginLoading(false);
     }
@@ -343,15 +386,15 @@ export default function App() {
 
   async function logout() {
     try {
-      const response = await fetch(`${API}/auth/logout`, { method: "POST", credentials: "include" });
-      if (!response.ok) throw new Error("Unable to sign out. Please retry.");
+      const response = await apiFetch("/auth/logout", { method: "POST" });
+      await readApiResponse(response, "Unable to sign out. Please retry.");
       setCurrentUser(null);
       setAuthStatus("signed-out");
       setSessionExpired(false);
       setActiveTab("Dashboard");
       clearProtectedData();
     } catch (error) {
-      setNotice({ type: "error", text: error.message || "Unable to sign out. Please retry." });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Unable to sign out. Please retry.") });
     }
   }
 
@@ -387,11 +430,7 @@ export default function App() {
         }),
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.message || "Unable to create the account.");
-      }
+      const data = await readApiResponse(response, "Unable to create the account.");
 
       setCreatedAccount(data.account);
       setNotice({
@@ -401,19 +440,19 @@ export default function App() {
       setForm(initialForm);
 
       // Refresh the account directory after a successful creation.
-      const refresh = await apiFetch("/accounts");
-      if (refresh.ok) {
-        const refreshedData = await refresh.json();
-        setAccounts(refreshedData.accounts || []);
+      try {
+        const refresh = await apiFetch("/accounts");
+        if (refresh.ok) {
+          const refreshedData = await readApiResponse(refresh, "Could not refresh the account directory.");
+          setAccounts(refreshedData.accounts || []);
+        } else {
+          setNotice({ type: "success", text: "Account created successfully. The account directory could not be refreshed." });
+        }
+      } catch {
+        setNotice({ type: "success", text: "Account created successfully. The account directory could not be refreshed." });
       }
     } catch (error) {
-      setNotice({
-        type: "error",
-        text:
-          error.message === "Failed to fetch"
-            ? "Cannot reach the backend. Check that your server is running on port 5000."
-            : error.message,
-      });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Unable to create the account.") });
     } finally {
       setLoading(false);
     }
@@ -454,8 +493,7 @@ export default function App() {
           }),
         }
       );
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Transaction could not be completed.");
+      const data = await readApiResponse(response, "Transaction could not be completed.");
 
       setTransactionResult(data.transaction);
       if (selectedAccountNumberRef.current === accountNumber) {
@@ -468,20 +506,24 @@ export default function App() {
       setTransactionAmount("");
 
       const params = new URLSearchParams({ accountNumber });
-      const historyResponse = await apiFetch(`/transactions?${params}`);
-      if (historyResponse.ok) {
-        const historyData = await historyResponse.json();
-        if (selectedAccountNumberRef.current === accountNumber) {
-          setTransactionAccount(historyData.account);
-          setTransactionHistory(historyData.transactions || []);
+      try {
+        const historyResponse = await apiFetch(`/transactions?${params}`);
+        if (historyResponse.ok) {
+          const historyData = await readApiResponse(historyResponse, "Could not refresh transaction history.");
+          if (selectedAccountNumberRef.current === accountNumber) {
+            setTransactionAccount(historyData.account);
+            setTransactionHistory(historyData.transactions || []);
+          }
+        } else {
+          setNotice({ type: "success", text: `${data.message} Transaction history could not be refreshed.` });
         }
+      } catch {
+        setNotice({ type: "success", text: `${data.message} Transaction history could not be refreshed.` });
       }
     } catch (error) {
       setNotice({
         type: "error",
-        text: error.message === "Failed to fetch"
-          ? "Cannot reach the backend. Check that your server is running on port 5000."
-          : error.message,
+        text: getUserErrorMessage(error, "Transaction could not be completed."),
       });
     } finally {
       setTransactionLoading(false);
@@ -497,15 +539,22 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(staffForm),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not create staff account.");
+      const data = await readApiResponse(response, "Could not create staff account.");
       setNotice({ type: "success", text: data.message });
       setStaffForm({ username: "", password: "", role: "STAFF" });
-      const refreshed = await apiFetch("/admin/staff");
-      const refreshedData = await refreshed.json();
-      if (refreshed.ok) setStaff(refreshedData.staff || []);
+      try {
+        const refreshed = await apiFetch("/admin/staff");
+        if (refreshed.ok) {
+          const refreshedData = await readApiResponse(refreshed, "Could not refresh staff accounts.");
+          setStaff(refreshedData.staff || []);
+        } else {
+          setNotice({ type: "success", text: "Staff account created. The staff list could not be refreshed." });
+        }
+      } catch {
+        setNotice({ type: "success", text: "Staff account created. The staff list could not be refreshed." });
+      }
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not create staff account.") });
     }
   }
 
@@ -521,12 +570,11 @@ export default function App() {
           customerId: Number(customerUserForm.customerId),
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not create customer sign-in.");
+      const data = await readApiResponse(response, "Could not create customer sign-in.");
       setNotice({ type: "success", text: data.message });
       setCustomerUserForm({ customerId: "", username: "", password: "" });
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not create customer sign-in.") });
     }
   }
 
@@ -537,12 +585,11 @@ export default function App() {
     setNotice(null);
     try {
       const response = await apiFetch(`/accounts/${accountNumber}`);
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not load account details.");
+      const data = await readApiResponse(response, "Could not load account details.");
       setAccountDetails(data.account);
       return data.account;
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not load account details.") });
       return null;
     } finally {
       setAccountDetailsLoading(false);
@@ -570,8 +617,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(accountEditForm),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not update customer details.");
+      const data = await readApiResponse(response, "Could not update customer details.");
       setAccountDetails((previous) => ({ ...previous, ...data.account }));
       setAccounts((previous) => previous.map((account) =>
         account.accountNumber === data.account.accountNumber
@@ -581,7 +627,7 @@ export default function App() {
       setEditingAccount(false);
       setNotice({ type: "success", text: data.message });
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not update customer details.") });
     } finally {
       setAccountEditLoading(false);
     }
@@ -594,14 +640,13 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ role }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not update role.");
+      const data = await readApiResponse(response, "Could not update role.");
       setNotice({ type: "success", text: data.message });
       setStaff((previous) => previous.map((person) =>
         person.userId === userId ? { ...person, role } : person
       ));
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not update role.") });
     }
   }
 
@@ -613,8 +658,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirm: true }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not deactivate account.");
+      const data = await readApiResponse(response, "Could not deactivate account.");
       setAccounts((previous) => previous.map((account) =>
         account.accountNumber === accountNumber ? { ...account, status: data.status } : account
       ));
@@ -623,7 +667,7 @@ export default function App() {
       );
       setNotice({ type: "success", text: data.message });
     } catch (error) {
-      setNotice({ type: "error", text: error.message });
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not deactivate account.") });
     }
   }
 

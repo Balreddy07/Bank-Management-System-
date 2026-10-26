@@ -12,6 +12,10 @@ Set `SESSION_SECRET` to a randomly generated value of at least 32 characters. `S
 
 Run `npm run migrate` to create the separate `security_audit_logs` table. It records successful and failed logins, account lockouts, authorization denials, logouts, account-detail edits, and account deactivations with a database timestamp, outcome, actor reference, and target reference when available. Audit events are kept separate from financial transaction history and omit usernames, request bodies, passwords, tokens, and other credentials. A failed audit write within an account mutation or login transaction rolls back that operation; logging failures for denials and logout are reported using a sanitized server error and do not weaken the denial or undo logout. Failed account lookup attempts are logged on a best-effort basis without changing the API outcome. Administrators may read recent events through `GET /api/admin/audit-logs?limit=50` (1–100 rows). No automated retention period is configured because the backlog does not specify one; retention and archival should follow the deploying institution's policy.
 
+## API errors
+
+API failures return JSON with a user-facing `message`. Invalid input returns HTTP 400 or 422 with a correction-oriented message; unauthenticated and forbidden requests return 401 and 403 respectively. Unhandled unexpected errors return a generic HTTP 500 response, while request bodies that exceed the configured limit return HTTP 413. Responses do not include stack traces, SQL text, or database internals. The server logs safe diagnostic metadata for unhandled errors. Clients should retain entered form data after a failed request and must only show a successful financial operation after receiving its committed response.
+
 To initialize the first administrator in PowerShell without putting the password in shell history:
 
 ```powershell

@@ -7,6 +7,7 @@
     "test": "node --test",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "benchmark:transactions": "node src/scripts/benchmark-transactions.js",
     "migrate": "node src/scripts/migrate.js",
     "initialize-admin": "node src/scripts/initialize-admin.js",
     "reset-admin-password": "node src/scripts/reset-admin-password.js"

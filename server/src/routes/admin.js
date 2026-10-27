@@ -48,9 +48,12 @@ function createAdminRouter({ databasePool }) {
   });
 
   router.post("/staff", async (req, res) => {
-    const username = typeof req.body?.username === "string" ? req.body.username.trim().toLowerCase() : "";
-    const password = typeof req.body?.password === "string" ? req.body.password : "";
-    const role = req.body?.role;
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? req.body
+      : {};
+    const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const role = body.role;
     if (!USERNAME_PATTERN.test(username) || password.length < 12 || Buffer.byteLength(password, "utf8") > 72 || !["ADMIN", "STAFF"].includes(role)) {
       return res.status(400).json({ message: "Provide a valid username, a password of at least 12 characters and at most 72 bytes, and an allowed role." });
     }
@@ -70,11 +73,14 @@ function createAdminRouter({ databasePool }) {
   });
 
   router.post("/customer-users", async (req, res) => {
-    const customerId = Number(req.body?.customerId);
-    const username = typeof req.body?.username === "string"
-      ? req.body.username.trim().toLowerCase()
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? req.body
+      : {};
+    const customerId = Number(body.customerId);
+    const username = typeof body.username === "string"
+      ? body.username.trim().toLowerCase()
       : "";
-    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const password = typeof body.password === "string" ? body.password : "";
     if (
       !Number.isSafeInteger(customerId) ||
       customerId < 1 ||

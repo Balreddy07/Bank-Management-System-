@@ -1303,6 +1303,40 @@ test("unknown accounts are rejected", async () => {
   });
 });
 
+test("protected routes reject unauthenticated access, insufficient permissions, and malformed admin bodies", async () => {
+  const staffDatabase = new FakeAuthPool([await makeAuthUser({ role: "STAFF" })]);
+  await withAuthApi(staffDatabase, async (baseUrl) => {
+    const unauthenticated = await fetch(`${baseUrl}/accounts`);
+    assert.equal(unauthenticated.status, 401);
+
+    const staffSession = await login(baseUrl);
+    const insufficientPermissions = await fetch(`${baseUrl}/admin/staff`, {
+      method: "POST",
+      headers: {
+        Cookie: sessionCookie(staffSession),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ username: "new.staff", password: "Correct-Horse-Battery-42!", role: "STAFF" }),
+    });
+    assert.equal(insufficientPermissions.status, 403);
+  });
+
+  const adminDatabase = new FakeAuthPool([await makeAuthUser({ role: "ADMIN" })]);
+  await withAuthApi(adminDatabase, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const malformed = await fetch(`${baseUrl}/admin/staff`, {
+      method: "POST",
+      headers: {
+        Cookie: sessionCookie(loggedIn),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["bad-input"]),
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json()).message, "Provide a valid username, a password of at least 12 characters and at most 72 bytes, and an allowed role.");
+  });
+});
+
 test("inactive accounts cannot transact", async () => {
   const database = new FakePool({ status: "INACTIVE" });
   await withApi(database, async (baseUrl) => {

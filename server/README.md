@@ -16,6 +16,42 @@ Run `npm run migrate` to create the separate `security_audit_logs` table. It rec
 
 API failures return JSON with a user-facing `message`. Invalid input returns HTTP 400 or 422 with a correction-oriented message; unauthenticated and forbidden requests return 401 and 403 respectively. Unhandled unexpected errors return a generic HTTP 500 response, while request bodies that exceed the configured limit return HTTP 413. Responses do not include stack traces, SQL text, or database internals. The server logs safe diagnostic metadata for unhandled errors. Clients should retain entered form data after a failed request and must only show a successful financial operation after receiving its committed response.
 
+## API reference
+
+The following endpoints are implemented in the repository and should be treated as the authoritative backend contract unless explicitly superseded by newer migrations or a release note.
+
+### Authentication and session
+
+- `POST /api/auth/login` — Sign in with `{ "username": "...", "password": "..." }`; returns the current authenticated user on success.
+- `GET /api/auth/session` — Returns `{ "user": { ... } }` or `{ "user": null, "sessionExpired": true }` when a cookie is present but invalid.
+- `POST /api/auth/logout` — Destroys the current session and clears the cookie.
+
+### Accounts
+
+- `GET /api/accounts` — Lists account records. Staff/admin may read all matching records; customers may read only their own accounts. Supports `search` as a query parameter.
+- `GET /api/accounts/:accountNumber` — Retrieves an individual account. Customers may access only their own account.
+- `POST /api/accounts` — Creates a customer and a new account for staff/admin roles only. Request body requires `fullName`, `address`, `phone`, `idProofType`, `idProofNumber`, and `initialDeposit` (minimum ₹500.00).
+- `PATCH /api/accounts/:accountNumber` — Updates customer contact details for admin/staff roles only.
+- `PATCH /api/accounts/:accountNumber/deactivate` — Marks an account inactive with explicit confirmation.
+
+### Transactions
+
+- `POST /api/transactions/deposit` — Records a deposit for an active account. Requires a valid 10-digit `accountNumber` and positive amount with at most two decimal places.
+- `POST /api/transactions/withdraw` — Records a withdrawal for an active account. Requires a valid 10-digit `accountNumber` and positive amount while preserving the ₹1,000.00 minimum retained balance.
+- `GET /api/transactions?accountNumber=...` — Lists a bounded transaction history for the account. Customers only see their own account history.
+- `GET /api/transactions/:transactionRef` — Retrieves a single transaction receipt. Customers only see receipts for their own account.
+
+### Reports and administration
+
+- `GET /api/reports?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD` — Requires admin access and validates date ordering and a maximum range of 367 days.
+- `GET /api/admin/audit-logs?limit=1..100` — Lists recent audit events for administrators.
+- `GET /api/admin/staff` — Lists staff accounts for administrative use.
+- `POST /api/admin/staff` — Creates a staff or administrator account.
+- `POST /api/admin/customer-users` — Creates a customer sign-in credential for an existing customer record.
+- `PATCH /api/admin/staff/:userId/role` — Changes the role of a staff user while protecting the last active admin.
+
+All responses for non-`2xx` cases return JSON `{ "message": "..." }` or an error payload with a user-safe message. Successful mutation endpoints include the created account or receipt details in their bodies, and only committed operations are reported as successful to the client.
+
 To initialize the first administrator in PowerShell without putting the password in shell history:
 
 ```powershell

@@ -271,6 +271,10 @@ router.patch(
 );
 
 router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body
+    : {};
+
   const {
     fullName,
     address,
@@ -278,7 +282,11 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     idProofType,
     idProofNumber,
     initialDeposit,
-  } = req.body;
+  } = body;
+
+  const normalizedInitialDeposit = typeof initialDeposit === "string"
+    ? Number(initialDeposit)
+    : initialDeposit;
 
   // Validate required fields.
   if (
@@ -318,10 +326,10 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
   }
 
   if (
-    typeof initialDeposit !== "number" ||
-    !Number.isFinite(initialDeposit) ||
-    initialDeposit < 500 ||
-    initialDeposit > 9999999999.99
+    typeof normalizedInitialDeposit !== "number" ||
+    !Number.isFinite(normalizedInitialDeposit) ||
+    normalizedInitialDeposit < 500 ||
+    normalizedInitialDeposit > 9999999999.99
   ) {
     return res.status(400).json({
       message: "Initial deposit must be at least ₹500.",
@@ -329,7 +337,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
   }
 
   // Avoid unexpected floating-point precision in money values.
-  if (Math.round(initialDeposit * 100) !== initialDeposit * 100) {
+  if (Math.round(normalizedInitialDeposit * 100) !== normalizedInitialDeposit * 100) {
     return res.status(400).json({
       message: "Deposit can have at most two decimal places.",
     });
@@ -371,7 +379,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
           `INSERT INTO accounts
            (account_number, customer_id, balance)
            VALUES (?, ?, ?)`,
-          [accountNumber, customerId, initialDeposit.toFixed(2)]
+          [accountNumber, customerId, normalizedInitialDeposit.toFixed(2)]
         );
 
         accountCreated = true;
@@ -408,8 +416,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       [
         randomUUID(),
         accountId,
-        initialDeposit.toFixed(2),
-        initialDeposit.toFixed(2),
+        normalizedInitialDeposit.toFixed(2),
+        normalizedInitialDeposit.toFixed(2),
       ]
     );
 
@@ -421,7 +429,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       account: {
         accountNumber,
         customerId,
-        balance: initialDeposit.toFixed(2),
+        balance: normalizedInitialDeposit.toFixed(2),
         status: "ACTIVE",
       },
     });

@@ -1,0 +1,30 @@
+name: Backend tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node.js 22 backend suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install locked dependencies
+        working-directory: server
+        run: npm ci
+      - name: Run backend tests
+        working-directory: server
+        run: npm test

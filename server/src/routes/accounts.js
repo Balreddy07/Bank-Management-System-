@@ -276,9 +276,10 @@ router.patch(
 );
 
 router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
-  if (!isRecord(req.body)) {
-    return res.status(400).json({ message: "All customer and KYC fields are required." });
-  }
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body
+    : {};
+
   const {
     fullName: submittedFullName,
     address: submittedAddress,
@@ -286,7 +287,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     idProofType: submittedIdProofType,
     idProofNumber: submittedIdProofNumber,
     initialDeposit,
-  } = req.body;
+  } = body;
+
   const fullName = normalizeText(submittedFullName, 100);
   const address = normalizeText(submittedAddress, 255);
   const idProofType = normalizeText(submittedIdProofType, 30);
@@ -299,8 +301,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     !address ||
     !normalizedPhone ||
     !idProofType ||
-    !/^[A-Za-z][A-Za-z0-9 _-]*$/.test(idProofType) ||
-    !idProofNumber
+    !idProofNumber ||
+    !/^[A-Za-z][A-Za-z0-9 _-]*$/.test(idProofType)
   ) {
     return res.status(400).json({
       message: "All customer and KYC fields are required.",
@@ -312,6 +314,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       message: "Initial deposit must be at least ₹500.",
     });
   }
+
   const initialDepositValue = formatMoneyCents(initialDepositCents);
 
   let connection;

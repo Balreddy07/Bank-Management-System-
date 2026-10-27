@@ -16,6 +16,7 @@ Run `npm run migrate` to create the separate `security_audit_logs` table. It rec
 
 API failures return JSON with a user-facing `message`. Invalid input returns HTTP 400 or 422 with a correction-oriented message; unauthenticated and forbidden requests return 401 and 403 respectively. Unhandled unexpected errors return a generic HTTP 500 response, while request bodies that exceed the configured limit return HTTP 413. Responses do not include stack traces, SQL text, or database internals. The server logs safe diagnostic metadata for unhandled errors. Clients should retain entered form data after a failed request and must only show a successful financial operation after receiving its committed response.
 
+
 ## API reference
 
 The following endpoints are implemented in the repository and should be treated as the authoritative backend contract unless explicitly superseded by newer migrations or a release note.
@@ -51,6 +52,9 @@ The following endpoints are implemented in the repository and should be treated 
 - `PATCH /api/admin/staff/:userId/role` — Changes the role of a staff user while protecting the last active admin.
 
 All responses for non-`2xx` cases return JSON `{ "message": "..." }` or an error payload with a user-safe message. Successful mutation endpoints include the created account or receipt details in their bodies, and only committed operations are reported as successful to the client.
+
+Account and transaction endpoints validate account numbers and transaction references before querying. Account-opening and customer-edit text is trimmed and length-checked, phone numbers are validated and stored without common formatting separators, and ID-proof numbers retain their case and internal characters. Transaction amounts must be JSON numbers within the supported range with no more than two decimal places; opening deposits must be at least ₹500. Invalid requests are rejected before account or transaction mutations begin. Database values are passed as SQL parameters.
+
 
 To initialize the first administrator in PowerShell without putting the password in shell history:
 

@@ -284,9 +284,13 @@ class FakeAccountPool {
     this.accounts = [];
     this.transactions = [];
     this.committed = false;
+    this.connectionRequests = 0;
+    this.queryCount = 0;
   }
 
   async execute(sql, params) {
+    this.queryCount += 1;
+    this.lastQuery = { sql, params };
     if (sql.includes("FROM accounts a")) {
       this.searchParams = params;
       const [search, accountPattern, namePattern] = params;
@@ -303,6 +307,7 @@ class FakeAccountPool {
   }
 
   async getConnection() {
+    this.connectionRequests += 1;
     const database = this;
     let stagedAccount;
     let stagedTransaction;
@@ -1265,6 +1270,30 @@ test("invalid and non-positive withdrawal amounts are rejected", async () => {
   });
 });
 
+test("malformed and injection-shaped transaction identifiers never reach the database", async () => {
+  const database = new FakePool();
+  await withApi(database, async (baseUrl) => {
+    const invalidAccountNumber = await post(baseUrl, "/deposit", {
+      accountNumber: "7811288401' OR 1=1 --",
+      amount: 100,
+    });
+    assert.equal(invalidAccountNumber.status, 400);
+
+    const injectedQuery = await fetch(
+      `${baseUrl}?accountNumber=${encodeURIComponent("7811288401' OR 1=1 --")}`
+    );
+    assert.equal(injectedQuery.status, 400);
+
+    const invalidReference = await fetch(
+      `${baseUrl}/${encodeURIComponent("00000000-0000-4000-8000-000000000001' OR 1=1 --")}`
+    );
+    assert.equal(invalidReference.status, 400);
+    assert.equal(database.transactionLifecycle.begins, 0);
+    assert.equal(database.account.balance, "1500.00");
+    assert.equal(database.transactions.length, 0);
+  });
+});
+
 test("malformed withdrawal JSON is rejected with a client error", async () => {
   const database = new FakeAuthPool([await makeAuthUser()]);
   await withAuthApi(database, async (baseUrl) => {
@@ -1812,6 +1841,54 @@ test("account opening commits customer, account, and opening deposit atomically"
   });
 });
 
+test("invalid customer and account inputs are rejected before database operations", async () => {
+  const database = new FakeAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const validFields = {
+      fullName: "New Test Customer",
+      address: "1 Test Road",
+      phone: "9876543210",
+      idProofType: "PAN",
+      idProofNumber: "TEST12345",
+      initialDeposit: 500,
+    };
+    const invalidBodies = [
+      { ...validFields, fullName: "  " },
+      { ...validFields, fullName: "A".repeat(101) },
+      { ...validFields, address: "A".repeat(256) },
+      { ...validFields, address: "Road\nInjection" },
+      { ...validFields, phone: "not-a-phone" },
+      { ...validFields, idProofType: "PAN' OR 1=1 --" },
+      { ...validFields, idProofNumber: "X".repeat(101) },
+      { ...validFields, initialDeposit: 499.99 },
+      { ...validFields, initialDeposit: 500.001 },
+      { ...validFields, initialDeposit: 10000000000 },
+      { ...validFields, initialDeposit: "500" },
+    ];
+    for (const body of invalidBodies) {
+      const response = await fetch(baseUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400);
+      assert.equal(typeof (await response.json()).message, "string");
+    }
+
+    const invalidJsonShape = await fetch(baseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "null",
+    });
+    assert.equal(invalidJsonShape.status, 400);
+    assert.equal(database.connectionRequests, 0);
+    assert.equal(database.queryCount, 0);
+    assert.equal(database.accounts.length, 0);
+    assert.equal(database.transactions.length, 0);
+    assert.equal(database.committed, false);
+  });
+});
+
 test("duplicate ID proof registrations are rejected before any account record is created", async () => {
   class DuplicateIdProofPool extends FakeAccountPool {
     constructor() {
@@ -2152,6 +2229,15 @@ test("account directory searches by account number or customer name", async () =
     const tooLongSearch = await fetch(`${baseUrl}?search=${"a".repeat(101)}`);
     assert.equal(tooLongSearch.status, 400);
     assert.match((await tooLongSearch.json()).message, /100 characters or fewer/);
+  });
+});
+
+test("account directory rejects repeated search values before querying", async () => {
+  const database = new FakeAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    const repeatedSearch = await fetch(`${baseUrl}?search=asha&search=1`);
+    assert.equal(repeatedSearch.status, 400);
+    assert.equal(database.queryCount, 0);
   });
 });
 

@@ -4,6 +4,16 @@ const { randomInt, randomUUID } = require("node:crypto");
 const { requireRole } = require("../auth/middleware");
 const { writeAuditEvent } = require("../audit-logger");
 const pool = require("../db");
+const {
+  formatMoneyCents,
+  isRecord,
+  isValidAccountNumber,
+  normalizePhone,
+  normalizeText,
+  parseMoneyCents,
+} = require("../validation");
+
+const MIN_INITIAL_DEPOSIT_CENTS = 50000n;
 
 function generateAccountNumber() {
   // Always generates exactly 10 numeric digits.
@@ -21,7 +31,7 @@ async function writeFailedAccountAudit(databasePool, event) {
 function createDeactivateAccountHandler(databasePool) {
   return async (req, res) => {
     const { accountNumber } = req.params;
-    if (!/^\d{10}$/.test(accountNumber) || req.body?.confirm !== true) {
+    if (!isValidAccountNumber(accountNumber) || req.body?.confirm !== true) {
       return res.status(400).json({ message: "Provide a valid account number and explicit confirmation." });
     }
 
@@ -94,7 +104,7 @@ function createAccountRouter(databasePool = pool) {
 
   router.get("/:accountNumber", async (req, res) => {
     const { accountNumber } = req.params;
-    if (!/^\d{10}$/.test(accountNumber)) {
+    if (!isValidAccountNumber(accountNumber)) {
       return res.status(400).json({ message: "Enter a valid 10-digit account number." });
     }
 
@@ -129,9 +139,13 @@ function createAccountRouter(databasePool = pool) {
 
   router.get("/", async (req, res) => {
   try {
-    const search = String(req.query.search || "").trim();
+    const rawSearch = req.query.search === undefined ? "" : req.query.search;
+    if (typeof rawSearch !== "string") {
+      return res.status(400).json({ message: "Search must be a text value of 100 characters or fewer." });
+    }
+    const search = rawSearch.trim();
 
-    if (search.length > 100) {
+    if (Array.from(search).length > 100 || /\p{Cc}/u.test(search)) {
       return res.status(400).json({
         message: "Search must be 100 characters or fewer.",
       });
@@ -178,27 +192,18 @@ function createAccountRouter(databasePool = pool) {
 
 router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const { accountNumber } = req.params;
-  if (!/^\d{10}$/.test(accountNumber)) {
+  if (!isValidAccountNumber(accountNumber)) {
     return res.status(400).json({ message: "Enter a valid 10-digit account number." });
   }
 
-  const { fullName, address, phone } = req.body || {};
-  if (
-    typeof fullName !== "string" ||
-    typeof address !== "string" ||
-    typeof phone !== "string" ||
-    !fullName.trim() ||
-    !address.trim() ||
-    !phone.trim()
-  ) {
+  if (!isRecord(req.body)) {
     return res.status(400).json({ message: "Full name, address, and phone are required." });
   }
-  if (fullName.trim().length > 100 || address.trim().length > 255) {
+  const fullName = normalizeText(req.body.fullName, 100);
+  const address = normalizeText(req.body.address, 255);
+  const phone = normalizePhone(req.body.phone);
+  if (!fullName || !address || !phone) {
     return res.status(400).json({ message: "One or more fields exceed the allowed length." });
-  }
-  const normalizedPhone = phone.trim().replace(/[\s()-]/g, "");
-  if (!/^\+?[0-9]{7,15}$/.test(normalizedPhone) || normalizedPhone.length > 15) {
-    return res.status(400).json({ message: "Enter a valid phone number." });
   }
 
   let connection;
@@ -227,7 +232,7 @@ router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) 
 
     await connection.execute(
       "UPDATE customers SET full_name = ?, address = ?, phone = ? WHERE customer_id = ?",
-      [fullName.trim(), address.trim(), normalizedPhone, accounts[0].customer_id]
+      [fullName, address, phone, accounts[0].customer_id]
     );
     await writeAuditEvent(connection, {
       eventType: "ACCOUNT_EDIT_SUCCESS",
@@ -244,9 +249,9 @@ router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) 
       account: {
         accountNumber,
         customerId: accounts[0].customer_id,
-        fullName: fullName.trim(),
-        address: address.trim(),
-        phone: normalizedPhone,
+        fullName,
+        address,
+        phone,
       },
     });
   } catch (error) {
@@ -276,72 +281,41 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     : {};
 
   const {
-    fullName,
-    address,
-    phone,
-    idProofType,
-    idProofNumber,
+    fullName: submittedFullName,
+    address: submittedAddress,
+    phone: submittedPhone,
+    idProofType: submittedIdProofType,
+    idProofNumber: submittedIdProofNumber,
     initialDeposit,
   } = body;
 
-  const normalizedInitialDeposit = typeof initialDeposit === "string"
-    ? Number(initialDeposit)
-    : initialDeposit;
+  const fullName = normalizeText(submittedFullName, 100);
+  const address = normalizeText(submittedAddress, 255);
+  const idProofType = normalizeText(submittedIdProofType, 30);
+  const idProofNumber = normalizeText(submittedIdProofNumber, 100);
+  const normalizedPhone = normalizePhone(submittedPhone);
+  const initialDepositCents = parseMoneyCents(initialDeposit);
 
-  // Validate required fields.
   if (
-    typeof fullName !== "string" ||
-    typeof address !== "string" ||
-    typeof phone !== "string" ||
-    typeof idProofType !== "string" ||
-    typeof idProofNumber !== "string" ||
-    !fullName.trim() ||
-    !address.trim() ||
-    !phone.trim() ||
-    !idProofType.trim() ||
-    !idProofNumber.trim()
+    !fullName ||
+    !address ||
+    !normalizedPhone ||
+    !idProofType ||
+    !idProofNumber ||
+    !/^[A-Za-z][A-Za-z0-9 _-]*$/.test(idProofType)
   ) {
     return res.status(400).json({
       message: "All customer and KYC fields are required.",
     });
   }
 
-  if (
-    fullName.trim().length > 100 ||
-    address.trim().length > 255 ||
-    idProofType.trim().length > 30 ||
-    idProofNumber.trim().length > 100
-  ) {
-    return res.status(400).json({
-      message: "One or more fields exceed the allowed length.",
-    });
-  }
-
-  const normalizedPhone = phone.trim().replace(/[\s()-]/g, "");
-
-  if (!/^\+?[0-9]{7,15}$/.test(normalizedPhone) || normalizedPhone.length > 15) {
-    return res.status(400).json({
-      message: "Enter a valid phone number.",
-    });
-  }
-
-  if (
-    typeof normalizedInitialDeposit !== "number" ||
-    !Number.isFinite(normalizedInitialDeposit) ||
-    normalizedInitialDeposit < 500 ||
-    normalizedInitialDeposit > 9999999999.99
-  ) {
+  if (initialDepositCents === null || initialDepositCents < MIN_INITIAL_DEPOSIT_CENTS) {
     return res.status(400).json({
       message: "Initial deposit must be at least ₹500.",
     });
   }
 
-  // Avoid unexpected floating-point precision in money values.
-  if (Math.round(normalizedInitialDeposit * 100) !== normalizedInitialDeposit * 100) {
-    return res.status(400).json({
-      message: "Deposit can have at most two decimal places.",
-    });
-  }
+  const initialDepositValue = formatMoneyCents(initialDepositCents);
 
   let connection;
   let transactionStarted = false;
@@ -357,11 +331,11 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
        (full_name, address, phone, id_proof_type, id_proof_number)
        VALUES (?, ?, ?, ?, ?)`,
       [
-        fullName.trim(),
-        address.trim(),
+        fullName,
+        address,
         normalizedPhone,
-        idProofType.trim(),
-        idProofNumber.trim(),
+        idProofType.toUpperCase(),
+        idProofNumber,
       ]
     );
 
@@ -379,7 +353,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
           `INSERT INTO accounts
            (account_number, customer_id, balance)
            VALUES (?, ?, ?)`,
-          [accountNumber, customerId, normalizedInitialDeposit.toFixed(2)]
+          [accountNumber, customerId, initialDepositValue]
         );
 
         accountCreated = true;
@@ -416,8 +390,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       [
         randomUUID(),
         accountId,
-        normalizedInitialDeposit.toFixed(2),
-        normalizedInitialDeposit.toFixed(2),
+        initialDepositValue,
+        initialDepositValue,
       ]
     );
 
@@ -429,7 +403,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       account: {
         accountNumber,
         customerId,
-        balance: normalizedInitialDeposit.toFixed(2),
+        balance: initialDepositValue,
         status: "ACTIVE",
       },
     });

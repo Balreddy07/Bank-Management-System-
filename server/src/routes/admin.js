@@ -1,6 +1,7 @@
 const bcrypt = require("bcrypt");
 const express = require("express");
 const { createDeactivateAccountHandler } = require("./accounts");
+const { parsePositiveInteger } = require("../validation");
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,64}$/;
 
@@ -76,14 +77,13 @@ function createAdminRouter({ databasePool }) {
     const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
       ? req.body
       : {};
-    const customerId = Number(body.customerId);
+    const customerId = parsePositiveInteger(body.customerId);
     const username = typeof body.username === "string"
       ? body.username.trim().toLowerCase()
       : "";
     const password = typeof body.password === "string" ? body.password : "";
     if (
-      !Number.isSafeInteger(customerId) ||
-      customerId < 1 ||
+      customerId === null ||
       !USERNAME_PATTERN.test(username) ||
       password.length < 12 ||
       Buffer.byteLength(password, "utf8") > 72
@@ -129,9 +129,9 @@ function createAdminRouter({ databasePool }) {
   });
 
   router.patch("/staff/:userId/role", async (req, res) => {
-    const userId = Number(req.params.userId);
+    const userId = parsePositiveInteger(req.params.userId);
     const { role } = req.body || {};
-    if (!Number.isSafeInteger(userId) || userId < 1 || !["ADMIN", "STAFF"].includes(role)) {
+    if (userId === null || !["ADMIN", "STAFF"].includes(role)) {
       return res.status(400).json({ message: "Provide a valid staff account and role." });
     }
     if (String(req.user.userId) === String(userId) && role !== "ADMIN") {

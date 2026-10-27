@@ -18,6 +18,27 @@ API failures return JSON with a user-facing `message`. Invalid input returns HTT
 
 Account and transaction endpoints validate account numbers and transaction references before querying. Account-opening and customer-edit text is trimmed and length-checked, phone numbers are validated and stored without common formatting separators, and ID-proof numbers retain their case and internal characters. Transaction amounts must be JSON numbers within the supported range with no more than two decimal places; opening deposits must be at least ₹500. Invalid requests are rejected before account or transaction mutations begin. Database values are passed as SQL parameters.
 
+## Automated functional and regression tests
+
+Run the complete backend suite from this directory with `npm ci` followed by `npm test`. The test command uses Node's built-in test runner and exits unsuccessfully if any test fails. The suite uses real HTTP requests against locally started Express test servers with isolated in-memory database doubles; helper and error-handler tests use deterministic stubs. These are automated functional/API tests, **not live-MySQL integration tests**. They do not need credentials, production data, or a database service.
+
+The existing suite covers the documented functional requirements:
+
+| Requirement | Automated coverage |
+| --- | --- |
+| FR-1: Open an account with KYC details and an initial deposit of at least ₹500 | Successful atomic account opening; invalid and boundary inputs; duplicate ID-proof rejection; rollback on opening-deposit failure |
+| FR-2: Generate a unique 10-digit account number | Account-number format validation, collision retries, and rollback after the retry limit |
+| FR-3: View, edit, or deactivate an account | Account search/details, persisted edits, deactivation, audit-failure rollback, and role checks |
+| FR-4: Preserve the ₹1,000 minimum balance on withdrawals | Boundary withdrawals, insufficient/negative-balance rejection, no-record assertions, rollback, and concurrent withdrawals |
+| FR-5: Generate a unique transaction reference and receipt | Deposit/withdrawal receipt shape, reference collision handling, committed-receipt lookup, and idempotent retries |
+| FR-6: Lock a user after three failed logins for 15 minutes | Valid/invalid login, generic failure responses, three-attempt and concurrent-failure lockout, lock duration, and recovery after expiry |
+| FR-7: Record each deposit/withdrawal with timestamp, type, amount, and post-transaction balance | Persisted transaction and receipt fields, history ordering, stable ties, and history limits |
+| FR-8: Generate an administrator report for a date range | Admin authorization, aggregate totals and active-account summary, inclusive date boundaries, empty ranges, and invalid-range rejection |
+
+Additional regression tests cover session protection and expiry, customer account/receipt ownership, password hashing, authorization, idempotency-key scope and duplicate submissions, transaction atomicity, and controlled error responses. The report tests validate response data and date handling using a fake database; they do not establish the FR-8 ten-second response-time target against a live database. No live database performance or integration result is claimed by this suite.
+
+GitHub Actions runs `npm ci` and the full `npm test` suite on Node.js 22 for every pull request and every push to `main`. No database credentials or external database service are used in CI.
+
 To initialize the first administrator in PowerShell without putting the password in shell history:
 
 ```powershell

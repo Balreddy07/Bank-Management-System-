@@ -122,6 +122,32 @@ Enter the exact existing administrator username, type the displayed `RESET <user
 
 It does not create an administrator, run at server startup, or expose an HTTP endpoint. Do not pipe passwords into the command or run it on an untrusted machine.
 
+## Session capacity benchmark
+
+The session benchmark runs only against an authorized local or staging API with a dedicated test user. It creates independent authenticated sessions using the normal `/api/auth/login` flow and `securebank.sid` cookie, then keeps each successful session active by periodically requesting a protected endpoint until the configured duration ends. It logs each established session out at the end of the run and separately reports logout failures. It does not bypass login throttling, extend session expiry, mutate banking data, or compensate for production security controls. Production-looking targets are blocked; remote targets require `--allow-remote` and `LOAD_TEST_TARGET_ENVIRONMENT=test` or `staging`.
+
+The benchmark defines `concurrency` as the maximum number of simultaneous HTTP requests and `target-sessions` as the number of sessions it attempts to keep concurrently authenticated. Ramp-up spreads session creation over the configured ramp-up interval. A live report distinguishes attempted/successful/failed authentication and protected requests, measures peak active authenticated sessions, request throughput, latency percentiles, errors, and CPU/memory usage of the benchmark client process. Server and database CPU/memory are not observable through this HTTP-only tool and must be collected separately from the authorized test environment. Reports do not contain passwords or session cookies.
+
+The issue specifies a four-second response-time target but does not state a percentile. For this project's evaluation, the benchmark explicitly uses **p95 protected-request latency** as its chosen criterion: the session target is met only when peak active authenticated sessions reach the configured target and p95 is at or below 4,000 ms. The report states this interpretation separately from the issue wording. A live run exits nonzero if the target is missed or authentication/protected-request errors occur. Dry-run is separate, makes no network requests, and is not a measurement.
+
+The application login limiter permits 20 login attempts per IP per 15 minutes. A test that needs more sessions must not disable or weaken that production control; use only an explicitly authorized test environment with its own approved setup. A rate-limited run reports the failures and does not establish that the target passed. Do not run this benchmark against production or real customer accounts.
+
+Example PowerShell setup for a local test instance:
+
+```powershell
+$env:LOAD_TEST_USERNAME = Read-Host "Dedicated test username"
+$securePassword = Read-Host "Dedicated test password" -AsSecureString
+$env:LOAD_TEST_PASSWORD = [System.Net.NetworkCredential]::new("", $securePassword).Password
+$env:LOAD_TEST_API_BASE_URL = "http://127.0.0.1:5000"
+$env:LOAD_TEST_TARGET_SESSIONS = "1000"
+$env:LOAD_TEST_CONCURRENCY = "50"
+$env:LOAD_TEST_DURATION_MS = "30000"
+$env:LOAD_TEST_RAMP_UP_MS = "5000"
+npm run load:test:session -- --dry-run
+```
+
+Only after verifying the API, database, test identity, and test environment are ready, remove `--dry-run` to perform the live measurement. The dry-run output deliberately reports no achieved sessions and cannot be treated as performance evidence.
+
 ## Transactions
 
 ## Roles and permissions

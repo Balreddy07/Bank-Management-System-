@@ -5,10 +5,12 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test",
+    "test:session-capacity": "node --test test/session-capacity.test.js",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "benchmark:transactions": "node src/scripts/benchmark-transactions.js",
     "load:concurrent": "node src/scripts/concurrent-load-runner.js",
+    "load:test:session": "node scripts/session-benchmark.js",
     "migrate": "node src/scripts/migrate.js",
     "initialize-admin": "node src/scripts/initialize-admin.js",
     "reset-admin-password": "node src/scripts/reset-admin-password.js"

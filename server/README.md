@@ -164,6 +164,31 @@ The JSON report contains actual per-request HTTP response durations, status coun
 
 The environment section records Node.js, OS, CPU count, memory, API origin, and supplied database/pool/dataset metadata; secrets and account identifiers are not printed. The reported response time includes network and server response delivery, authentication, and database work as exercised by the API, but not the test user's login request.
 
+## Concurrent user load and integrity test
+
+Run `npm run load:concurrent` from the `server` directory only against a local instance or an explicitly authorized test/staging system backed by a dedicated disposable database and test account. The runner performs authenticated account reads, deposits, withdrawals, history queries, and receipt lookups. Each logical transaction sends two simultaneous requests with the same idempotency key to verify replay behavior. Successful receipts are checked against receipt lookups, withdrawal balances are checked against the ₹1,000.00 minimum, transaction references are checked for duplicates, and the final balance is reconciled against committed receipts.
+
+The runner is intentionally separate from `npm test`. It requires `CONCURRENT_LOAD_ALLOW_MUTATIONS=true`, a dedicated account number, and test-user credentials. It does not undo records or automatically compensate failed requests; a failed/ambiguous request can leave a balance change, so use disposable data only. It signs in once and shares that authenticated session across virtual users; VUs represent concurrent clients, not distinct user identities.
+
+PowerShell setup for a local test system:
+
+```powershell
+npm ci
+$env:CONCURRENT_LOAD_ALLOW_MUTATIONS = "true"
+$env:CONCURRENT_LOAD_ACCOUNT_NUMBER = "<10-digit-test-account>"
+$env:CONCURRENT_LOAD_USERNAME = "<test-staff-user>"
+$env:CONCURRENT_LOAD_PASSWORD = "<test-user-password>"
+$env:CONCURRENT_LOAD_VUS = "500"
+$env:CONCURRENT_LOAD_DURATION_SECONDS = "60"
+$env:CONCURRENT_LOAD_RAMP_UP_SECONDS = "30"
+$env:CONCURRENT_LOAD_AMOUNT = "1.00"
+npm run load:concurrent
+```
+
+Optional settings are `CONCURRENT_LOAD_API_URL` (defaults to `http://127.0.0.1:5000/api`), `CONCURRENT_LOAD_TIMEOUT_MS` (defaults to 10,000), and `CONCURRENT_LOAD_ALLOW_REMOTE` plus `CONCURRENT_LOAD_TARGET_ENVIRONMENT=test|staging` for an authorized remote target. Production targets are blocked; remote targets require both explicit settings. Never point this runner at production or accounts containing real funds.
+
+The JSON report includes configured and peak active VUs, duration, ramp-up, throughput, request timeouts, p50/p95/p99 latency, transaction completion percentage within 2,000 ms, sanitized endpoint/status errors, and integrity failure codes. It reports the measured run only; accepting `500` as a configuration value is not evidence that 500 VUs were actually reached or that the 95% response-time target passed. The bundled runner test uses a local fake HTTP API and does not verify MySQL locking or database integrity.
+
 ### Backlog 23 measurements
 
 As of 2026-10-26, no valid end-to-end baseline or post-optimization result has been collected in the implementation environment. Node.js v22.19.0 and an Intel Core i5-13420H (8 cores / 12 logical processors) were available. The application pool is configured for 10 connections (`waitForConnections: true`, `queueLimit: 0`) in `server/src/db.js`, but the local MySQL server rejected the configured connection with `ER_ACCESS_DENIED_ERROR`; the database version, schema/index definitions, and dataset size could not be read.

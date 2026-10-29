@@ -16,3 +16,6 @@ npm-debug.log*
 
 # Temporary audit report
 server/audit-report.json
+
+# Generated session-capacity evidence
+server/reports/session-capacity/

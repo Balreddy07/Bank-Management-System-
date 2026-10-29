@@ -623,8 +623,9 @@ async function hasNamedConstraint(connection, table, name, kind) {
   const expectedClauses = CHECK_CONSTRAINTS[name];
   const normalizedClause = String(rows[0].checkClause || "")
     .toLowerCase()
+    .replace(/\\'/g, "'")
     .replace(/`/g, "")
-    .replace(/_cp\d+|_utf8mb4/g, "")
+    .replace(/_ascii|_cp\d+|_utf8mb4/g, "")
     .replace(/\s+/g, "")
     .replace(/[()]/g, "");
   if (

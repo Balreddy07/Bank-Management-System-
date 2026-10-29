@@ -15,12 +15,14 @@ class MigrationPool {
     applied = [],
     ledgerExists = true,
     nullableColumns = [],
+    checkConstraints = {},
   } = {}) {
     this.version = version;
     this.issues = issues;
     this.applied = new Map(applied.map((migration) => [migration.version, migration]));
     this.ledgerExists = ledgerExists;
     this.nullableColumns = new Set(nullableColumns);
+    this.checkConstraints = checkConstraints;
     this.statements = [];
     this.released = 0;
   }
@@ -69,6 +71,11 @@ class MigrationPool {
     }
     if (sql.includes("INFORMATION_SCHEMA.KEY_COLUMN_USAGE")) return [[]];
     if (sql.includes("INFORMATION_SCHEMA.STATISTICS")) return [[]];
+    if (sql.includes("tc.CONSTRAINT_TYPE AS constraintType")) {
+      const [tableName, constraintName] = params;
+      const constraint = this.checkConstraints[`${tableName}.${constraintName}`];
+      return [constraint ? [constraint] : []];
+    }
     if (sql.includes("INFORMATION_SCHEMA.TABLE_CONSTRAINTS")) return [[]];
     if (sql.includes("INSERT INTO schema_migrations")) {
       const [version, name, checksum] = params;
@@ -111,6 +118,89 @@ test("migrations are ordered and recorded, and a second run is a no-op", async (
     firstRunStatements
   );
   assert.equal(pool.released, 2);
+});
+
+test("migration accepts MySQL's normalized, enforced ten-digit account CHECK", async () => {
+  const pool = new MigrationPool({
+    checkConstraints: {
+      "accounts.chk_account_number_digits": {
+        constraintType: "CHECK",
+        enforced: "YES",
+        checkClause: "regexp_like(`account_number`,_ascii\\'^[0-9]{10}$\\')",
+      },
+    },
+  });
+
+  await migrate({ databasePool: pool, logger: { log() {} } });
+
+  assert.ok(pool.applied.has("005"));
+  assert.equal(
+    pool.statements.some((statement) =>
+      statement.includes("ADD CONSTRAINT chk_account_number_digits")
+    ),
+    false
+  );
+});
+
+test("migration adds an account-number CHECK when the named constraint is missing", async () => {
+  const pool = new MigrationPool();
+
+  await migrate({ databasePool: pool, logger: { log() {} } });
+
+  assert.ok(pool.applied.has("005"));
+  assert.ok(pool.statements.some((statement) =>
+    statement.includes("ADD CONSTRAINT chk_account_number_digits")
+  ));
+});
+
+test("migration rejects an unenforced account-number CHECK", async () => {
+  const pool = new MigrationPool({
+    checkConstraints: {
+      "accounts.chk_account_number_digits": {
+        constraintType: "CHECK",
+        enforced: "NO",
+        checkClause: "account_number REGEXP '^[0-9]{10}$'",
+      },
+    },
+  });
+
+  await assert.rejects(
+    migrate({ databasePool: pool, logger: { log() {} } }),
+    /Check constraint accounts\.chk_account_number_digits exists but is not the expected enforced rule/
+  );
+
+  assert.equal(pool.applied.has("005"), false);
+  assert.equal(
+    pool.statements.some((statement) =>
+      statement.includes("ADD CONSTRAINT chk_account_number_digits")
+    ),
+    false
+  );
+});
+
+test("migration rejects an incorrect account-number CHECK rule", async () => {
+  const pool = new MigrationPool({
+    checkConstraints: {
+      "accounts.chk_account_number_digits": {
+        constraintType: "CHECK",
+        enforced: "YES",
+        checkClause: "regexp_like(account_number,_utf8mb4'^[0-9]{9}$')",
+      },
+    },
+  });
+
+  await assert.rejects(
+    migrate({ databasePool: pool, logger: { log() {} } }),
+    /Check constraint accounts\.chk_account_number_digits exists but is not the expected enforced rule/
+  );
+
+  assert.equal(pool.applied.has("005"), false);
+  assert.equal(
+    pool.statements.some((statement) =>
+      statement.includes("ADD CONSTRAINT chk_account_number_digits")
+    ),
+    false
+  );
 });
 
 test("fresh and upgrade schemas define the required banking constraints", async () => {

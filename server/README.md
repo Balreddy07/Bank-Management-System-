@@ -164,6 +164,57 @@ The JSON report contains actual per-request HTTP response durations, status coun
 
 The environment section records Node.js, OS, CPU count, memory, API origin, and supplied database/pool/dataset metadata; secrets and account identifiers are not printed. The reported response time includes network and server response delivery, authentication, and database work as exercised by the API, but not the test user's login request.
 
+## Authenticated session capacity and response-time test
+
+The session-capacity runner exercises the actual MySQL-backed `express-session` cookie flow: each client performs its own `POST /api/auth/login`, retains the resulting independent `securebank.sid` cookie, then repeatedly calls the non-mutating protected `GET /api/accounts` endpoint. These are independent authenticated cookie sessions, not concurrent requests sharing one login. The test account is reused; no accounts or credentials are provisioned by the runner. Login/logout also write the application's authentication audit events and create/delete session rows.
+
+Run this only against a local instance or explicitly authorized, isolated test/staging environment with dedicated test credentials and disposable test data. The runner never submits deposits, withdrawals, transfers, or other banking mutations. Remote use requires explicit opt-in and a `test` or `staging` target; production-looking URLs and production target labels are blocked. The runner first verifies that the protected endpoint rejects a request without a cookie and sends no load if that check fails.
+
+The existing login endpoint enforces a limit of 20 login attempts per source IP per 15 minutes. This runner does not bypass or alter that security control: it currently uses one source address, so an attempt to create 1,000 sessions will normally be throttled and will report those 429 responses and the sessions actually achieved. It does not yet support distributed load-generator addresses. Do not claim a 1,000-session result based on the configured client count. A valid 1,000-session measurement requires an approved test arrangement that can authenticate 1,000 clients without weakening the production limiter (for example, an explicitly approved non-production authentication policy). The existing process-local limiter and 10-connection MySQL pool are potential scale constraints, not measured bottlenecks.
+
+Run the focused automated tests and a two-client local smoke test from this `server` directory:
+
+```powershell
+npm ci
+npm test
+node --test test/session-capacity.test.js
+
+$env:CONCURRENT_SESSIONS_USERNAME = Read-Host "Dedicated test username"
+$securePassword = Read-Host "Dedicated test password" -AsSecureString
+$env:CONCURRENT_SESSIONS_PASSWORD = [System.Net.NetworkCredential]::new("", $securePassword).Password
+$env:CONCURRENT_SESSIONS_CLIENTS = "2"
+$env:CONCURRENT_SESSIONS_DURATION_SECONDS = "5"
+$env:CONCURRENT_SESSIONS_RAMP_UP_SECONDS = "1"
+$env:CONCURRENT_SESSIONS_WARMUP_REQUESTS = "1"
+npm run load:sessions
+Remove-Item Env:CONCURRENT_SESSIONS_USERNAME, Env:CONCURRENT_SESSIONS_PASSWORD
+Remove-Variable securePassword
+```
+
+For the requested 1,000-client run, keep the target local or use only an explicitly authorized staging environment. A 1,000-client configuration is supported, but the login limiter above may prevent it from being achieved:
+
+```powershell
+$env:CONCURRENT_SESSIONS_USERNAME = Read-Host "Dedicated test username"
+$securePassword = Read-Host "Dedicated test password" -AsSecureString
+$env:CONCURRENT_SESSIONS_PASSWORD = [System.Net.NetworkCredential]::new("", $securePassword).Password
+$env:CONCURRENT_SESSIONS_CLIENTS = "1000"
+$env:CONCURRENT_SESSIONS_DURATION_SECONDS = "60"
+$env:CONCURRENT_SESSIONS_RAMP_UP_SECONDS = "30"
+$env:CONCURRENT_SESSIONS_WARMUP_REQUESTS = "1"
+$env:CONCURRENT_SESSIONS_TIMEOUT_MS = "10000"
+npm run load:sessions
+Remove-Item Env:CONCURRENT_SESSIONS_USERNAME, Env:CONCURRENT_SESSIONS_PASSWORD
+Remove-Variable securePassword
+```
+
+Required settings are `CONCURRENT_SESSIONS_USERNAME` and `CONCURRENT_SESSIONS_PASSWORD`. Optional settings are `CONCURRENT_SESSIONS_API_URL` (defaults to `http://127.0.0.1:5000/api`), `CONCURRENT_SESSIONS_CLIENTS` (1–1,000; defaults to 10), `CONCURRENT_SESSIONS_DURATION_SECONDS` (1–3,600; defaults to 30), `CONCURRENT_SESSIONS_RAMP_UP_SECONDS` (0–duration; defaults to 10), `CONCURRENT_SESSIONS_WARMUP_REQUESTS` (0–10 per successful login; defaults to 1), `CONCURRENT_SESSIONS_TIMEOUT_MS` (100–120,000; defaults to 10,000), `CONCURRENT_SESSIONS_PROTECTED_PATH` (relative GET path under the API; defaults to `accounts`), and `CONCURRENT_SESSIONS_REPORT_DIR` (defaults to `reports/session-capacity`). A remote test/staging target additionally requires `CONCURRENT_SESSIONS_ALLOW_REMOTE=true` and `CONCURRENT_SESSIONS_TARGET_ENVIRONMENT=test` or `staging`. Never put credentials in command history, reports, or Git; use the local environment or an untracked `.env` file.
+
+Each run writes a timestamped JSON and Markdown report to the configured report directory (ignored by Git). Reports include configured clients, successful distinct session cookies, peak overlapping authenticated clients, login and protected-request outcomes, timeouts/network failures and HTTP status counts, p50/p95/p99/mean/max latency, throughput, and load-generator CPU/RSS/heap observations. The runner cannot observe the separate API host's CPU/memory or MySQL resource use through the HTTP API; those values are explicitly reported as unavailable. Server-side metrics must be collected separately to identify actual resource bottlenecks.
+
+Potential follow-ups, to evaluate only after an authorized real run, are to provide a safe non-production way to seed/authenticate enough test clients without changing production controls; collect API process/event-loop and MySQL connection/query/session-store telemetry; and evaluate the login limiter's process-local store and the 10-connection database pool against measured demand. These are hypotheses and recommendations, not measured bottlenecks or completed optimizations.
+
+The four-second rule is explicitly defined for this report as at least 95% of all measured protected requests completing successfully (2xx) within 4,000 ms; p95 is reported separately and is not silently treated as the acceptance rule. The 1,000-session result passes only when peak concurrent successfully authenticated cookie sessions reaches 1,000. A configured target, successful smoke test, or response-time result at lower concurrency is not evidence that 1,000 sessions were achieved. Current local evidence is **NOT TESTED** until a full authorized 1,000-client run generates its reports.
+
 ## Concurrent user load and integrity test
 
 Run `npm run load:concurrent` from the `server` directory only against a local instance or an explicitly authorized test/staging system backed by a dedicated disposable database and test account. The runner performs authenticated account reads, deposits, withdrawals, history queries, and receipt lookups. Each logical transaction sends two simultaneous requests with the same idempotency key to verify replay behavior. Successful receipts are checked against receipt lookups, withdrawal balances are checked against the ₹1,000.00 minimum, transaction references are checked for duplicates, and the final balance is reconciled against committed receipts.

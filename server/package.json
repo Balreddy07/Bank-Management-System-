@@ -13,6 +13,7 @@
     "load:sessions": "node src/scripts/session-capacity-runner.js",
     "setup:session-users": "node src/scripts/setup-session-test-users.js",
     "migrate": "node src/scripts/migrate.js",
+    "migrate:status": "node src/scripts/migrate.js --status",
     "initialize-admin": "node src/scripts/initialize-admin.js",
     "reset-admin-password": "node src/scripts/reset-admin-password.js"
   },

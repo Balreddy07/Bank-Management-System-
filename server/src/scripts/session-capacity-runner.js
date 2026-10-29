@@ -1,3 +1,4 @@
+
 const os = require("node:os");
 const { mkdir, writeFile } = require("node:fs/promises");
 const path = require("node:path");
@@ -16,10 +17,25 @@ function parseInteger(value, name, minimum, maximum) {
 }
 
 function getConfiguration(environment = process.env) {
-  const username = environment.CONCURRENT_SESSIONS_USERNAME;
   const password = environment.CONCURRENT_SESSIONS_PASSWORD;
-  if (!username || !password) {
-    throw new Error("Set CONCURRENT_SESSIONS_USERNAME and CONCURRENT_SESSIONS_PASSWORD to dedicated test credentials.");
+  const usernamePrefix = environment.CONCURRENT_SESSIONS_USERNAME_PREFIX || "sessionload";
+  const legacyUsername = environment.CONCURRENT_SESSIONS_USERNAME;
+
+  if (!password) {
+    throw new Error("Set CONCURRENT_SESSIONS_PASSWORD to dedicated test credentials.");
+  }
+
+  const useUniqueUsers = environment.CONCURRENT_SESSIONS_USE_UNIQUE_USERS !== "false";
+
+  if (
+    useUniqueUsers &&
+    !/^[a-z0-9._-]{3,54}$/.test(usernamePrefix)
+  ) {
+    throw new Error("CONCURRENT_SESSIONS_USERNAME_PREFIX must be 3–54 lowercase letters, digits, dots, underscores, or hyphens.");
+  }
+
+  if (!useUniqueUsers && !legacyUsername) {
+    throw new Error("Set CONCURRENT_SESSIONS_USERNAME when unique users are disabled.");
   }
 
   let apiUrl;
@@ -28,6 +44,7 @@ function getConfiguration(environment = process.env) {
   } catch {
     throw new Error("CONCURRENT_SESSIONS_API_URL must be an absolute HTTP or HTTPS URL.");
   }
+
   if (!["http:", "https:"].includes(apiUrl.protocol) || apiUrl.username || apiUrl.password) {
     throw new Error("Use an HTTP or HTTPS API URL without embedded credentials.");
   }
@@ -37,13 +54,16 @@ function getConfiguration(environment = process.env) {
   if (hostname.split(/[.-]/).some((label) => label === "prod" || label === "production")) {
     throw new Error("Production-looking targets are blocked; use a dedicated local, test, or staging system.");
   }
+
   const isLocal = ["localhost", "127.0.0.1", "::1"].includes(hostname);
   const targetEnvironment = String(
     environment.CONCURRENT_SESSIONS_TARGET_ENVIRONMENT || (isLocal ? "local" : "")
   ).toLowerCase();
+
   if (targetEnvironment === "production") {
     throw new Error("Production targets are not permitted.");
   }
+
   if (!isLocal && (
     environment.CONCURRENT_SESSIONS_ALLOW_REMOTE !== "true" ||
     !["test", "staging"].includes(targetEnvironment)
@@ -58,6 +78,7 @@ function getConfiguration(environment = process.env) {
   } catch {
     throw new Error("CONCURRENT_SESSIONS_PROTECTED_PATH must be a relative API path without invalid encoding.");
   }
+
   if (
     typeof protectedPath !== "string" ||
     !protectedPath.trim() ||
@@ -76,26 +97,31 @@ function getConfiguration(environment = process.env) {
     1,
     MAX_CLIENTS
   );
+
   const durationSeconds = parseInteger(
     environment.CONCURRENT_SESSIONS_DURATION_SECONDS || 30,
     "CONCURRENT_SESSIONS_DURATION_SECONDS",
     1,
     MAX_DURATION_SECONDS
   );
+
   const rampUpSeconds = parseInteger(
     environment.CONCURRENT_SESSIONS_RAMP_UP_SECONDS || 10,
     "CONCURRENT_SESSIONS_RAMP_UP_SECONDS",
     0,
     MAX_DURATION_SECONDS
   );
+
   if (rampUpSeconds > durationSeconds) {
     throw new Error("CONCURRENT_SESSIONS_RAMP_UP_SECONDS must not exceed the duration.");
   }
 
   return {
     apiUrl,
-    username,
     password,
+    usernamePrefix,
+    legacyUsername,
+    useUniqueUsers,
     clients,
     durationSeconds,
     rampUpSeconds,
@@ -117,6 +143,11 @@ function getConfiguration(environment = process.env) {
   };
 }
 
+function usernameForClient(configuration, index) {
+  if (!configuration.useUniqueUsers) return configuration.legacyUsername;
+  return `${configuration.usernamePrefix}${String(index + 1).padStart(4, "0")}`;
+}
+
 function summarizeLatency(samples) {
   if (samples.length === 0) {
     return {
@@ -133,12 +164,14 @@ function summarizeLatency(samples) {
       targetMs: RESPONSE_TIME_TARGET_MS,
     };
   }
-  const sorted = samples.map((sample) => sample.durationMs).sort((left, right) => left - right);
+
+  const sorted = samples.map((sample) => sample.durationMs).sort((a, b) => a - b);
   const percentile = (percent) => sorted[Math.ceil((percent / 100) * sorted.length) - 1];
   const successfulRequests = samples.filter((sample) => sample.success).length;
-  const successfulWithinTarget = samples.filter((sample) =>
-    sample.success && sample.durationMs <= RESPONSE_TIME_TARGET_MS
+  const successfulWithinTarget = samples.filter(
+    (sample) => sample.success && sample.durationMs <= RESPONSE_TIME_TARGET_MS
   ).length;
+
   return {
     requests: samples.length,
     successfulRequests,
@@ -165,12 +198,14 @@ function statusBreakdown(samples) {
 function createMarkdownReport(report) {
   const protectedLatency = report.latency.protectedRequests;
   const formatMetric = (value) => value === null ? "n/a" : `${value} ms`;
+
   return [
     "# Session capacity and response-time report",
     "",
     `- Run: ${report.generatedAt}`,
     `- Target: ${report.target.environment} (${report.target.origin})`,
     `- Scenario: ${report.scenario}`,
+    `- Authentication mode: ${report.workload.authenticationMode}`,
     `- Workload: ${report.workload.requestedClients} clients; ${report.workload.rampUpSeconds}s ramp-up; ${report.workload.durationSeconds}s workload duration`,
     `- Independent sessions achieved: ${report.capacity.peakConcurrentAuthenticatedClients} peak concurrent clients from ${report.capacity.successfullyAuthenticatedClients} successful logins`,
     `- 1,000-session target: **${report.acceptance.oneThousandSessionsAchieved ? "PASS" : "NOT MET"}**`,
@@ -202,7 +237,7 @@ function createMarkdownReport(report) {
     `- Database resources: ${report.resources.database.observation}.`,
     `- Errors: ${JSON.stringify(report.errors)}${report.omittedErrorCount ? ` (${report.omittedErrorCount} additional errors omitted)` : ""}.`,
     "",
-    "The four-second rule is explicitly evaluated as at least 95% of all measured protected requests returning a successful 2xx response within 4,000 ms. p95 is reported as a second view of latency, not used as an undocumented substitute for that rule. A NOT MET session target is not evidence that the runner could not be configured for 1,000 clients; review authentication throttling, achieved concurrency, and failures.",
+    "The four-second rule is at least 95% of measured protected requests returning a successful 2xx response within 4,000 ms. A NOT MET session target is not evidence that the runner could not be configured for 1,000 clients; review authentication throttling, achieved concurrency, and failures.",
     "",
   ].join("\n");
 }
@@ -218,29 +253,30 @@ function addRequest(context, category, sample) {
   }
 }
 
-async function request(context, category, target, {
-  method = "GET",
-  cookie,
-  body,
-} = {}) {
+async function request(context, category, target, { method = "GET", cookie, body } = {}) {
   const startedAt = process.hrtime.bigint();
+
   try {
     const headers = {};
     if (cookie) headers.Cookie = cookie;
     if (body !== undefined) headers["Content-Type"] = "application/json";
+
     const response = await context.fetchImpl(target, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(context.configuration.timeoutMs),
     });
+
     const responseBody = await response.text();
     let payload = null;
+
     try {
       payload = responseBody ? JSON.parse(responseBody) : null;
     } catch {
       payload = null;
     }
+
     return {
       result: {
         status: response.status,
@@ -269,6 +305,7 @@ function readSessionCookie(response) {
   const cookies = typeof response.headers.getSetCookie === "function"
     ? response.headers.getSetCookie()
     : [response.headers.get("set-cookie") || ""];
+
   for (const header of cookies) {
     const cookie = header.split(";", 1)[0].trim();
     if (cookie.startsWith("securebank.sid=") && cookie.length > "securebank.sid=".length) {
@@ -283,6 +320,7 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
   const startedAtHighResolution = process.hrtime.bigint();
   const cpuBefore = process.cpuUsage();
   const memoryBefore = process.memoryUsage();
+
   const context = {
     configuration,
     fetchImpl,
@@ -294,18 +332,16 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     activeAuthenticatedClients: 0,
     peakConcurrentAuthenticatedClients: 0,
   };
+
   const protectedUrl = new URL(configuration.protectedPath, configuration.apiUrl);
 
-  const unauthenticated = await request(
-    context,
-    "invalid-authentication-check",
-    protectedUrl
-  );
+  const unauthenticated = await request(context, "invalid-authentication-check", protectedUrl);
   if (unauthenticated.result.status !== 401) {
     throw new Error(
       `Protected endpoint preflight expected HTTP 401 without a cookie, received ${unauthenticated.result.status}; no load was started.`
     );
   }
+
   context.samples.push({
     category: "authentication-guard",
     ...unauthenticated.result,
@@ -322,15 +358,18 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     const waitMs = scheduledStart - Date.now();
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
 
+    const username = usernameForClient(configuration, index);
+
     const login = await request(
       context,
       "authentication",
       new URL("auth/login", configuration.apiUrl),
       {
         method: "POST",
-        body: { username: configuration.username, password: configuration.password },
+        body: { username, password: configuration.password },
       }
     );
+
     const cookie = login.response ? readSessionCookie(login.response) : null;
     const userRole = login.payload?.user?.role;
     const authenticatedResponse = Boolean(
@@ -338,6 +377,7 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
       ["ADMIN", "STAFF", "CUSTOMER"].includes(userRole) &&
       cookie
     );
+
     login.result.success = authenticatedResponse;
     if (authenticatedResponse && context.sessionCookies.has(cookie)) {
       login.result.success = false;
@@ -345,14 +385,17 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     } else if (authenticatedResponse) {
       context.sessionCookies.add(cookie);
     }
+
     if (login.response?.ok && !authenticatedResponse) {
       login.result.status = cookie ? "INVALID_LOGIN_RESPONSE" : "MISSING_SESSION_COOKIE";
     }
+
     addRequest(context, "authentication", login.result);
     if (!login.result.success) return;
 
     context.authenticatedClients += 1;
     const withinTestWindow = Date.now() < endAt;
+
     if (withinTestWindow) {
       context.activeAuthenticatedClients += 1;
       context.peakConcurrentAuthenticatedClients = Math.max(
@@ -362,7 +405,11 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     }
 
     try {
-      for (let warmup = 0; withinTestWindow && warmup < configuration.warmupRequests; warmup += 1) {
+      for (
+        let warmup = 0;
+        withinTestWindow && warmup < configuration.warmupRequests;
+        warmup += 1
+      ) {
         const result = await request(context, "warmup", protectedUrl, { cookie });
         addRequest(context, "warmup", result.result);
       }
@@ -373,6 +420,7 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
       }
     } finally {
       if (withinTestWindow) context.activeAuthenticatedClients -= 1;
+
       const logout = await request(
         context,
         "logout",
@@ -383,20 +431,28 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     }
   }
 
-  await Promise.all(Array.from({ length: configuration.clients }, (_, index) => clientWorker(index)));
+  await Promise.all(
+    Array.from({ length: configuration.clients }, (_, index) => clientWorker(index))
+  );
+
   const elapsedMs = Number(process.hrtime.bigint() - startedAtHighResolution) / 1e6;
   const memoryAfter = process.memoryUsage();
   const cpuAfter = process.cpuUsage(cpuBefore);
+
   const authenticationSamples = context.samples.filter((sample) => sample.category === "authentication");
   const protectedSamples = context.samples.filter((sample) => sample.category === "protected-request");
   const authenticationSuccesses = authenticationSamples.filter((sample) => sample.success).length;
   const protectedLatency = summarizeLatency(protectedSamples);
   const statusCounts = statusBreakdown(context.samples);
   const successfulWithinTargetPercent = protectedLatency.successfulWithinTargetPercent ?? 0;
+
   const report = {
     scenario: "independent-authenticated-cookie-session-capacity",
     generatedAt: new Date().toISOString(),
-    target: { environment: configuration.targetEnvironment, origin: configuration.apiUrl.origin },
+    target: {
+      environment: configuration.targetEnvironment,
+      origin: configuration.apiUrl.origin,
+    },
     system: {
       node: process.version,
       platform: `${os.platform()} ${os.release()} ${os.arch()}`,
@@ -405,6 +461,9 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     },
     workload: {
       requestedClients: configuration.clients,
+      authenticationMode: configuration.useUniqueUsers
+        ? `unique users with prefix ${configuration.usernamePrefix}`
+        : "shared account (legacy mode)",
       durationSeconds: configuration.durationSeconds,
       rampUpSeconds: configuration.rampUpSeconds,
       warmupRequestsPerAuthenticatedClient: configuration.warmupRequests,
@@ -465,26 +524,41 @@ async function runSessionCapacityTest(configuration, { fetchImpl = fetch } = {})
     errors: context.errors,
     omittedErrorCount: context.omittedErrorCount,
   };
+
   return report;
 }
 
 async function writeReports(report, reportDirectory) {
   const resolvedDirectory = path.resolve(reportDirectory);
   await mkdir(resolvedDirectory, { recursive: true });
+
   const fileStem = `session-capacity-${report.generatedAt.replace(/[:.]/g, "-")}`;
   const jsonPath = path.join(resolvedDirectory, `${fileStem}.json`);
   const markdownPath = path.join(resolvedDirectory, `${fileStem}.md`);
+
   await writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
   await writeFile(markdownPath, createMarkdownReport(report), { flag: "wx" });
+
   return { jsonPath, markdownPath };
 }
 
 async function main() {
   require("dotenv").config();
   const configuration = getConfiguration();
+
+  if (configuration.useUniqueUsers) {
+    console.log(
+      `Using unique test users ${usernameForClient(configuration, 0)} through ${usernameForClient(configuration, configuration.clients - 1)}`
+    );
+  } else {
+    console.warn("WARNING: shared-account mode is enabled; this is not an independent-user capacity test.");
+  }
+
   const report = await runSessionCapacityTest(configuration);
   const reportPaths = await writeReports(report, configuration.reportDirectory);
+
   console.log(JSON.stringify({ report, reportPaths }, null, 2));
+
   if (
     report.workload.failedRequests > 0 ||
     !report.acceptance.oneThousandSessionsAchieved ||
@@ -507,5 +581,6 @@ module.exports = {
   getConfiguration,
   runSessionCapacityTest,
   summarizeLatency,
+  usernameForClient,
   writeReports,
 };

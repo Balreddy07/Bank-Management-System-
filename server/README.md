@@ -6,7 +6,7 @@ Start the API from this directory with `npm run dev` for development or `npm sta
 
 Authentication uses bcrypt password hashes, HTTP-only `SameSite=Lax` session cookies, and a MySQL-backed `user_sessions` table. Sessions expire after 30 minutes of inactivity; each authenticated request refreshes that sliding timeout. There is no separate absolute session lifetime. Expiration is enforced by the session store when the request arrives, and an expired record encountered during lookup is deleted without affecting other sessions.
 
-Run `npm run migrate` to add `staff_users`, `user_sessions`, and the additive `customer_users` credential table. These migrations use `CREATE TABLE IF NOT EXISTS` and do not alter banking data. The session table is additive and is not stored in process memory.
+Run `npm run migrate` to create or upgrade the database schema. Versioned migrations preserve existing banking records and do not reset or seed the database.
 
 Set `SESSION_SECRET` to a randomly generated value of at least 32 characters. `SESSION_COOKIE_SECURE=true` is required when serving over HTTPS; it defaults to secure cookies in production mode. `SESSION_COOKIE_SAME_SITE` may be `lax`, `strict`, or `none`; `none` requires secure cookies. Set `CORS_ORIGINS` to exact trusted frontend origins for a split-origin deployment, and set the frontend build variable `VITE_API_BASE` to its API base URL. The default Vite proxy keeps local requests same-origin. Login requests are additionally limited to 20 per IP per 15 minutes using the rate limiter's default process-local store.
 
@@ -17,6 +17,50 @@ Run `npm run migrate` to create the separate `security_audit_logs` table. It rec
 Audit events are kept separate from financial transaction history and omit usernames, request bodies, passwords, tokens, and other credentials. A failed audit write within an account mutation or login transaction rolls back that operation; logging failures for denials and logout are reported using a sanitized server error and do not weaken the denial or undo logout. Failed account lookup attempts are logged on a best-effort basis without changing the API outcome.
 
 Administrators may read recent events through `GET /api/admin/audit-logs?limit=50` (1–100 rows). No automated retention period is configured because the backlog does not specify one; retention and archival should follow the deploying institution's policy.
+
+## Database schema and migrations
+
+The application supports MySQL 8.0.16 or later. This minimum is required because earlier MySQL versions parse but do not enforce `CHECK` constraints.
+
+For a fresh local development database, create a new empty database in MySQL, configure the existing `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` environment variables for that database, then run:
+
+```sh
+npm run migrate
+```
+
+For example, the one-time database creation command for a new local database is:
+
+```sql
+CREATE DATABASE bank_management_system
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+Do not run that command against an existing database. Migration `000` creates the core `customers`, `accounts`, and `transactions` tables only when they are absent. Migrations `001`–`004` create the supporting authentication, session, idempotency, and audit-log tables. Migration `005` validates existing banking data and applies constraints to existing tables. `CREATE TABLE IF NOT EXISTS` does not replace or reset an existing table.
+
+Applied versions, names, SHA-256 checksums, and timestamps are recorded in `schema_migrations`. Existing installations without this ledger can be upgraded: the earlier table-creation scripts are repeatable, and are recorded after they succeed. To see the current migration state without applying changes, run:
+
+```sh
+npm run migrate:status
+```
+
+Migration `005` checks for duplicate or malformed account numbers, missing required values, duplicate identity proofs or transaction references, invalid balances/amounts/types, and orphaned customer, account, and staff references before applying constraints. It reports issue categories and counts without printing financial or customer values. If a check fails, the migration stops before applying constraints and does not change or delete existing records. An operator must inspect the affected rows, choose and approve a correction that preserves financial history, and rerun `npm run migrate`; no records are automatically repaired, renumbered, or removed.
+
+For example, operators can inspect account-number problems using read-only queries before planning an approved correction:
+
+```sql
+SELECT account_id
+FROM accounts
+WHERE account_number IS NULL
+   OR account_number NOT REGEXP '^[0-9]{10}$';
+
+SELECT account_number, COUNT(*) AS duplicate_count
+FROM accounts
+GROUP BY account_number
+HAVING COUNT(*) > 1;
+```
+
+Back up the database and review the exact migration DDL and data-validation results under the institution's change-control process before applying it to a production database. The migration runner uses a database advisory lock, records a migration only after its statements succeed, verifies recorded checksums, and safely skips constraints already present. The related test suite uses isolated in-memory database doubles; it does not connect to a live MySQL server.
 
 ## API errors
 
@@ -84,6 +128,7 @@ The existing suite covers the documented functional requirements:
 | FR-6: Lock a user after three failed logins for 15 minutes | Valid/invalid login, generic failure responses, three-attempt and concurrent-failure lockout, lock duration, and recovery after expiry |
 | FR-7: Record each deposit/withdrawal with timestamp, type, amount, and post-transaction balance | Persisted transaction and receipt fields, history ordering, stable ties, and history limits |
 | FR-8: Generate an administrator report for a date range | Admin authorization, aggregate totals and active-account summary, inclusive date boundaries, empty ranges, and invalid-range rejection |
+| Database constraints and migrations | Ordered migration tracking and repeat runs, checksum/version verification, MySQL version guards, preflight rejection of invalid data, and required-column upgrades |
 
 Additional regression tests cover session protection and expiry, customer account/receipt ownership, password hashing, authorization, idempotency-key scope and duplicate submissions, transaction atomicity, and controlled error responses.
 
@@ -132,7 +177,7 @@ The supported roles are `ADMIN`, `STAFF`, and `CUSTOMER`. Every banking API requ
 - `CUSTOMER` credentials are provisioned by an administrator for an existing customer; there is no public registration. Customers may list, view, and search only accounts associated with their authenticated customer identity, and view transaction history/receipts for those owned accounts. Customers cannot open or edit accounts, deactivate accounts, post deposits/withdrawals, view reports, or use administrative endpoints.
 - Protected routes deny requests with missing or unrecognized roles. Ownership is resolved from the database-backed session identity, not a customer ID supplied by the client. Requests for another customer's account or receipt return the same not-found response as an unknown record.
 
-Run `npm run migrate` before enabling customer login. The banking `customers` and `accounts` table definitions are not included in this repository; the `customer_users.customer_id` column uses the repository's `BIGINT UNSIGNED` convention but is not a foreign key. Verify its type is compatible with the deployed `customers.customer_id` before applying migrations. Administrators should transmit provisioned customer credentials through a secure channel.
+Run `npm run migrate` before enabling customer login. The `customer_users.customer_id` column references `customers.customer_id` with restrictive delete/update behavior; credentials cannot outlive or be reassigned from a customer through database-level deletion. Administrators should transmit provisioned customer credentials through a secure channel.
 
 Example transaction requests:
 
@@ -148,7 +193,7 @@ Transaction history is returned newest first, with transaction reference as a st
 
 Successful deposits and withdrawals return a receipt containing `transactionRef`, `createdAt`, `type`, `amount`, and `balanceAfter`. The reference is generated as a UUID, stored with the transaction, and returned only after the balance and transaction record have committed. A detected reference collision is retried a bounded number of times; other database errors roll back the balance change.
 
-Atomicity requires the `accounts` and `transactions` tables to use a transactional storage engine such as InnoDB. The banking table definitions are not included in this repository, so verify their storage engines in each deployed database before relying on rollback behavior.
+Atomicity requires the `accounts` and `transactions` tables to use InnoDB. Migration `000` creates them with that engine for fresh databases, and migration `005` verifies existing tables use InnoDB before adding constraints.
 
 ## Transaction response-time benchmark
 

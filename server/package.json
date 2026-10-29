@@ -10,6 +10,7 @@
     "benchmark:transactions": "node src/scripts/benchmark-transactions.js",
     "load:concurrent": "node src/scripts/concurrent-load-runner.js",
     "migrate": "node src/scripts/migrate.js",
+    "migrate:status": "node src/scripts/migrate.js --status",
     "initialize-admin": "node src/scripts/initialize-admin.js",
     "reset-admin-password": "node src/scripts/reset-admin-password.js"
   },

@@ -92,6 +92,7 @@ export default function App() {
   const [form, setForm] = useState(initialForm);
   const [accounts, setAccounts] = useState([]);
   const [accountSearch, setAccountSearch] = useState("");
+  const [accountStatusFilter, setAccountStatusFilter] = useState("");
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountDetails, setAccountDetails] = useState(null);
   const [accountDetailsLoading, setAccountDetailsLoading] = useState(false);
@@ -149,6 +150,7 @@ export default function App() {
   function clearProtectedData() {
     setAccounts([]);
     setAccountSearch("");
+    setAccountStatusFilter("");
     setAccountDetails(null);
     setEditingAccount(false);
     selectedAccountNumberRef.current = "";
@@ -226,6 +228,9 @@ export default function App() {
         if (activeTab === "Accounts" && accountSearch.trim()) {
           params.set("search", accountSearch.trim());
         }
+        if (activeTab === "Accounts" && accountStatusFilter) {
+          params.set("status", accountStatusFilter);
+        }
 
         const response = await apiFetch(
           `/accounts?${params.toString()}`,
@@ -257,7 +262,7 @@ export default function App() {
 
     loadAccounts();
     return () => controller.abort();
-  }, [activeTab, accountSearch, authStatus]);
+  }, [activeTab, accountSearch, accountStatusFilter, authStatus]);
 
   useEffect(() => {
     if (activeTab !== "Transactions" || !selectedAccountNumber) {
@@ -975,6 +980,30 @@ export default function App() {
                 {accountSearch && (
                   <button type="button" onClick={() => setAccountSearch("")}>
                     Clear
+                  </button>
+                )}
+              </div>
+
+              <div className="directory-filter-row">
+                <label className="directory-status-filter">
+                  <span>Status</span>
+                  <select
+                    value={accountStatusFilter}
+                    onChange={(event) => setAccountStatusFilter(event.target.value)}
+                    aria-label="Filter accounts by status"
+                  >
+                    <option value="">All statuses</option>
+                    <option value="ACTIVE">Active</option>
+                    <option value="INACTIVE">Inactive</option>
+                  </select>
+                </label>
+                {accountStatusFilter && (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => setAccountStatusFilter("")}
+                  >
+                    Clear status filter
                   </button>
                 )}
               </div>

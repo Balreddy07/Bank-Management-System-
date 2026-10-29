@@ -136,59 +136,91 @@ function createAccountRouter(databasePool = pool) {
       return res.status(500).json({ message: "Unable to retrieve account details." });
     }
   });
-
   router.get("/", async (req, res) => {
-  try {
-    const rawSearch = req.query.search === undefined ? "" : req.query.search;
-    if (typeof rawSearch !== "string") {
-      return res.status(400).json({ message: "Search must be a text value of 100 characters or fewer." });
-    }
-    const search = rawSearch.trim();
+    try {
+      const rawSearch =
+        req.query.search === undefined ? "" : req.query.search;
+      const rawStatus =
+        req.query.status === undefined ? "" : req.query.status;
 
-    if (Array.from(search).length > 100 || /\p{Cc}/u.test(search)) {
-      return res.status(400).json({
-        message: "Search must be 100 characters or fewer.",
+      // Validate the status filter.
+      if (
+        typeof rawStatus !== "string" ||
+        !["", "ACTIVE", "INACTIVE"].includes(rawStatus)
+      ) {
+        return res.status(400).json({
+          message: "Status must be ACTIVE or INACTIVE.",
+        });
+      }
+
+      // Validate the search input.
+      if (typeof rawSearch !== "string") {
+        return res.status(400).json({
+          message: "Search must be a text value of 100 characters or fewer.",
+        });
+      }
+
+      const search = rawSearch.trim();
+
+      if (Array.from(search).length > 100 || /\p{Cc}/u.test(search)) {
+        return res.status(400).json({
+          message: "Search must be 100 characters or fewer.",
+        });
+      }
+
+      const searchPattern = `%${search}%`;
+      const customerId =
+        req.user?.role === "CUSTOMER" ? req.user.customerId : null;
+
+      // Search by account number or customer name, apply the status
+      // filter, and restrict customer users to their own accounts.
+      const [accounts] = await databasePool.execute(
+        `SELECT
+           a.account_id AS accountId,
+           a.account_number AS accountNumber,
+           a.balance,
+           a.status,
+           a.created_at AS createdAt,
+           c.customer_id AS customerId,
+           c.full_name AS fullName,
+           c.address,
+           c.phone
+         FROM accounts a
+         INNER JOIN customers c
+           ON c.customer_id = a.customer_id
+         WHERE (
+           ? = ''
+           OR a.account_number LIKE ?
+           OR c.full_name LIKE ?
+         )
+           AND (? IS NULL OR c.customer_id = ?)
+           AND (? = '' OR a.status = ?)
+         ORDER BY a.created_at DESC
+         LIMIT 100`,
+        [
+          search,
+          searchPattern,
+          searchPattern,
+          customerId,
+          customerId,
+          rawStatus,
+          rawStatus,
+        ]
+      );
+
+      return res.status(200).json({ accounts });
+    } catch (error) {
+      console.error(
+        "Account listing failed:",
+        error.code || "unknown error"
+      );
+
+      return res.status(500).json({
+        message: "Unable to retrieve accounts.",
       });
     }
+  });
 
-    const searchPattern = `%${search}%`;
-
-    const [accounts] = await databasePool.execute(
-      `SELECT
-         a.account_id AS accountId,
-         a.account_number AS accountNumber,
-         a.balance,
-         a.status,
-         a.created_at AS createdAt,
-         c.customer_id AS customerId,
-         c.full_name AS fullName,
-         c.address,
-         c.phone
-       FROM accounts a
-       INNER JOIN customers c ON c.customer_id = a.customer_id
-       WHERE (? = ''
-          OR a.account_number LIKE ?
-          OR c.full_name LIKE ?)
-         AND (? IS NULL OR c.customer_id = ?)
-       ORDER BY a.created_at DESC
-       LIMIT 100`,
-      [
-        search,
-        searchPattern,
-        searchPattern,
-        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
-        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
-      ]
-    );
-
-    return res.status(200).json({ accounts });
-  } catch (error) {
-    console.error("Account listing failed:", error.code || "unknown error");
-    return res.status(500).json({
-      message: "Unable to retrieve accounts.",
-    });
-  }
-});
 
 router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const { accountNumber } = req.params;

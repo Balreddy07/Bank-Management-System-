@@ -127,10 +127,21 @@ test("session capacity configuration protects production and remote targets", ()
     })),
     /explicit opt-in/
   );
+  assert.throws(
+    () => getConfiguration(validEnvironment({
+      CONCURRENT_SESSIONS_API_URL: "http://staging.example.net/api",
+      CONCURRENT_SESSIONS_ALLOW_REMOTE: "true",
+      CONCURRENT_SESSIONS_TARGET_ENVIRONMENT: "staging",
+    })),
+    /must use HTTPS/
+  );
   assert.doesNotThrow(() => getConfiguration(validEnvironment({
     CONCURRENT_SESSIONS_API_URL: "https://staging.example.net/api",
     CONCURRENT_SESSIONS_ALLOW_REMOTE: "true",
     CONCURRENT_SESSIONS_TARGET_ENVIRONMENT: "staging",
+  })));
+  assert.doesNotThrow(() => getConfiguration(validEnvironment({
+    CONCURRENT_SESSIONS_API_URL: "http://127.0.0.1:5000/api",
   })));
 });
 

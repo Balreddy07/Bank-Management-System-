@@ -56,6 +56,10 @@ function getConfiguration(environment = process.env) {
   }
 
   const isLocal = ["localhost", "127.0.0.1", "::1"].includes(hostname);
+  if (!isLocal && apiUrl.protocol !== "https:") {
+    throw new Error("Remote targets must use HTTPS to protect test credentials and session cookies.");
+  }
+
   const targetEnvironment = String(
     environment.CONCURRENT_SESSIONS_TARGET_ENVIRONMENT || (isLocal ? "local" : "")
   ).toLowerCase();

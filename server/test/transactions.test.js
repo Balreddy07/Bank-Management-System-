@@ -473,6 +473,10 @@ class FakeCustomerAccountPool {
           stagedStatus = "INACTIVE";
           return [{ affectedRows: 1 }];
         }
+        if (sql.includes("UPDATE accounts SET status = 'ACTIVE'")) {
+          stagedStatus = "ACTIVE";
+          return [{ affectedRows: 1 }];
+        }
         throw new Error(`Unexpected customer-account connection query: ${sql}`);
       },
       async commit() {
@@ -680,6 +684,34 @@ class FakeAuthPool {
         if (sql.includes("UPDATE accounts SET status = 'INACTIVE'")) {
           database.pendingAccountStatus = { accountId: params[0], status: "INACTIVE" };
           return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("UPDATE accounts SET status = 'ACTIVE'")) {
+          database.pendingAccountStatus = { accountId: params[0], status: "ACTIVE" };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM accounts") && sql.includes("FOR UPDATE")) {
+          return [database.account.account_number === params[0] ? [{ ...database.account }] : []];
+        }
+        if (sql.includes("UPDATE accounts SET balance =")) {
+          database.account.balance = params[0];
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("INSERT INTO transactions")) {
+          database.transactions.push({
+            transactionRef: params[0],
+            transaction_ref: params[0],
+            account_id: params[1],
+            type: params[2],
+            amount: params[3],
+            balanceAfter: params[4],
+            balance_after: params[4],
+            createdAt: new Date(),
+          });
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM transactions") && sql.includes("WHERE transaction_ref = ?")) {
+          const row = database.transactions.find((tx) => (tx.transactionRef || tx.transaction_ref) === params[0]);
+          return [row ? [row] : []];
         }
         throw new Error(`Unexpected auth connection query: ${sql}`);
       },
@@ -3193,5 +3225,204 @@ test("admin staff creation rejects passwords exceeding bcrypt's byte limit", asy
     });
     assert.equal(response.status, 400);
     assert.equal(database.users.length, 1);
+  });
+});
+
+test("account status transition validates current status, confirmation, and logs audit events", async () => {
+  const database = new FakeCustomerAccountPool();
+  await withAccountApi(database, async (baseUrl) => {
+    // 1. Attempt status transition without explicit confirmation
+    const noConfirm = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "INACTIVE" }),
+    });
+    assert.equal(noConfirm.status, 400);
+
+    // 2. Attempt transition to an invalid status
+    const invalidStatus = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "SUSPENDED", confirm: true }),
+    });
+    assert.equal(invalidStatus.status, 400);
+
+    // 3. Attempt activation on an already ACTIVE account
+    const alreadyActive = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/activate`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(alreadyActive.status, 409);
+    assert.equal((await alreadyActive.json()).message, "Account is already active.");
+    assert.equal(database.account.status, "ACTIVE");
+
+    // 4. Successfully deactivate account
+    const deactivateRes = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/deactivate`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(deactivateRes.status, 200);
+    assert.equal((await deactivateRes.json()).status, "INACTIVE");
+    assert.equal(database.account.status, "INACTIVE");
+
+    // 5. Attempt repeat deactivation on already INACTIVE account
+    const repeatDeactivate = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "INACTIVE", confirm: true }),
+    });
+    assert.equal(repeatDeactivate.status, 409);
+    assert.equal((await repeatDeactivate.json()).message, "Account is already inactive.");
+
+    // 6. Successfully reactivate account via /activate
+    const activateRes = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/activate`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(activateRes.status, 200);
+    assert.equal((await activateRes.json()).status, "ACTIVE");
+    assert.equal(database.account.status, "ACTIVE");
+
+    // 7. Successfully transition to INACTIVE via /status
+    const statusToInactive = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "INACTIVE", confirm: true }),
+    });
+    assert.equal(statusToInactive.status, 200);
+    assert.equal(database.account.status, "INACTIVE");
+
+    // 8. Successfully transition to ACTIVE via /status
+    const statusToActive = await fetch(`${baseUrl}/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "ACTIVE", confirm: true }),
+    });
+    assert.equal(statusToActive.status, 200);
+    assert.equal(database.account.status, "ACTIVE");
+
+    // Verify audit logs contain activation and deactivation events
+    const eventTypes = database.auditEvents.map((e) => e.eventType);
+    assert.ok(eventTypes.includes("ACCOUNT_ACTIVATION_FAILURE"));
+    assert.ok(eventTypes.includes("ACCOUNT_DEACTIVATION_SUCCESS"));
+    assert.ok(eventTypes.includes("ACCOUNT_DEACTIVATION_FAILURE"));
+    assert.ok(eventTypes.includes("ACCOUNT_ACTIVATION_SUCCESS"));
+  });
+});
+
+test("account lifecycle enforces inactive restrictions and restores transactions upon activation", async () => {
+  const admin = await makeAuthUser({ role: "ADMIN" });
+  const database = new FakeAuthPool([admin]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl);
+    const headers = { Cookie: sessionCookie(loggedIn), "Content-Type": "application/json" };
+
+    // 1. Initial active account can deposit
+    const deposit1 = await fetch(`${baseUrl}/transactions/deposit`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 200 }),
+    });
+    assert.equal(deposit1.status, 201);
+
+    // 2. Deactivate the account via admin route
+    const deactivate = await fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(deactivate.status, 200);
+    assert.equal(database.account.status, "INACTIVE");
+
+    // 3. Prohibited operations rejected: deposit on inactive account
+    const depositInactive = await fetch(`${baseUrl}/transactions/deposit`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+    });
+    assert.equal(depositInactive.status, 409);
+    assert.match((await depositInactive.json()).message, /inactive account/);
+
+    // 4. Prohibited operations rejected: withdrawal on inactive account
+    const withdrawInactive = await fetch(`${baseUrl}/transactions/withdraw`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 100 }),
+    });
+    assert.equal(withdrawInactive.status, 409);
+    assert.match((await withdrawInactive.json()).message, /inactive account/);
+
+    // 5. Preserved operations: historical transactions remain retrievable
+    const history = await fetch(`${baseUrl}/transactions?accountNumber=${ACCOUNT_NUMBER}`, {
+      headers: { Cookie: sessionCookie(loggedIn) },
+    });
+    assert.equal(history.status, 200);
+    const historyResult = await history.json();
+    assert.equal(historyResult.account.status, "INACTIVE");
+    assert.ok(historyResult.transactions.length >= 1);
+
+    // 6. Reactivate the account via admin route
+    const activate = await fetch(`${baseUrl}/admin/accounts/${ACCOUNT_NUMBER}/activate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(activate.status, 200);
+    assert.equal(database.account.status, "ACTIVE");
+
+    // 7. Operations restored: deposit succeeds again
+    const depositRestored = await fetch(`${baseUrl}/transactions/deposit`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ accountNumber: ACCOUNT_NUMBER, amount: 300 }),
+    });
+    assert.equal(depositRestored.status, 201);
+  });
+});
+
+test("unauthorized customer users cannot perform account status transitions", async () => {
+  const customerUser = {
+    userId: 99,
+    customerId: 12,
+    username: "customer.user",
+    passwordHash: await bcrypt.hash("Correct-Horse-Battery-42!", 4),
+    role: "CUSTOMER",
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    isActive: 1,
+  };
+  const database = new FakeAuthPool([customerUser]);
+  await withAuthApi(database, async (baseUrl) => {
+    const loggedIn = await login(baseUrl, "customer.user");
+    assert.equal(loggedIn.status, 200);
+    const headers = { Cookie: sessionCookie(loggedIn), "Content-Type": "application/json" };
+
+    // Customer attempting to activate or deactivate returns 403
+    const deactRes = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/deactivate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(deactRes.status, 403);
+
+    const actRes = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/activate`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(actRes.status, 403);
+
+    const statusRes = await fetch(`${baseUrl}/accounts/${ACCOUNT_NUMBER}/status`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ status: "INACTIVE", confirm: true }),
+    });
+    assert.equal(statusRes.status, 403);
+
+    // Account status remains ACTIVE
+    assert.equal(database.account.status, "ACTIVE");
   });
 });

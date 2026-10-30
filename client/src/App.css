@@ -2031,6 +2031,27 @@
   background: #fff4f5;
 }
 
+.table-action-success {
+  border-color: #cde7d8;
+  color: #1a7f4c;
+}
+
+.table-action-success:hover {
+  border-color: #a8d9bc;
+  background: #f0faf4;
+}
+
+.transaction-inactive-warning {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #fff4f5;
+  border: 1px solid #f2d0d4;
+  color: #b43b4a;
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin-bottom: 12px;
+}
+
 .staff-form {
   margin-bottom: 28px;
 }

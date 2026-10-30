@@ -1,6 +1,10 @@
 const bcrypt = require("bcrypt");
 const express = require("express");
-const { createDeactivateAccountHandler } = require("./accounts");
+const {
+  createDeactivateAccountHandler,
+  createActivateAccountHandler,
+  createUpdateAccountStatusHandler,
+} = require("./accounts");
 const { parsePositiveInteger } = require("../validation");
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9._-]{3,64}$/;
@@ -177,6 +181,8 @@ function createAdminRouter({ databasePool }) {
   });
 
   router.patch("/accounts/:accountNumber/deactivate", createDeactivateAccountHandler(databasePool));
+  router.patch("/accounts/:accountNumber/activate", createActivateAccountHandler(databasePool));
+  router.patch("/accounts/:accountNumber/status", createUpdateAccountStatusHandler(databasePool));
 
   return router;
 }

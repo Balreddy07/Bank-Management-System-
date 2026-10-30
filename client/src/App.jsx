@@ -676,6 +676,28 @@ export default function App() {
     }
   }
 
+  async function activateAccount(accountNumber) {
+    if (!window.confirm(`Activate account ${accountNumber}? Further transactions will be permitted.`)) return;
+    try {
+      const response = await apiFetch(`/accounts/${accountNumber}/activate`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      const data = await readApiResponse(response, "Could not activate account.");
+      setAccounts((previous) => previous.map((account) =>
+        account.accountNumber === accountNumber ? { ...account, status: data.status } : account
+      ));
+      setAccountDetails((previous) =>
+        previous?.accountNumber === accountNumber ? { ...previous, status: data.status } : previous
+      );
+      setNotice({ type: "success", text: data.message });
+    } catch (error) {
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not activate account.") });
+    }
+  }
+
+
   if (authStatus === "checking") {
     return (
       <div className="auth-loading" role="status">
@@ -1092,6 +1114,13 @@ export default function App() {
                                     onClick={() => deactivateAccount(account.accountNumber)}
                                   >Deactivate</button>
                                 )}
+                                {currentUser.role !== "CUSTOMER" && account.status === "INACTIVE" && (
+                                  <button
+                                    className="table-action table-action-success"
+                                    type="button"
+                                    onClick={() => activateAccount(account.accountNumber)}
+                                  >Activate</button>
+                                )}
                               </div>
                             </td>
                           </tr>
@@ -1249,6 +1278,12 @@ export default function App() {
                       </span>
                     )}
                   </div>
+
+                  {selectedAccountNumber && transactionAccount?.status === "INACTIVE" && (
+                    <div className="transaction-inactive-warning" role="alert">
+                      Transactions are not allowed for an inactive account.
+                    </div>
+                  )}
 
                   <div className="transaction-mode" role="group" aria-label="Transaction type">
                     <button

@@ -28,12 +28,21 @@ async function writeFailedAccountAudit(databasePool, event) {
   }
 }
 
-function createDeactivateAccountHandler(databasePool) {
+function createAccountStatusTransitionHandler(databasePool, fixedTargetStatus = null) {
   return async (req, res) => {
     const { accountNumber } = req.params;
     if (!isValidAccountNumber(accountNumber) || req.body?.confirm !== true) {
       return res.status(400).json({ message: "Provide a valid account number and explicit confirmation." });
     }
+
+    const requestedStatus = fixedTargetStatus || req.body?.status;
+    if (typeof requestedStatus !== "string" || !["ACTIVE", "INACTIVE"].includes(requestedStatus.toUpperCase())) {
+      return res.status(400).json({ message: "Target status must be ACTIVE or INACTIVE." });
+    }
+    const targetStatus = requestedStatus.toUpperCase();
+    const isDeactivation = targetStatus === "INACTIVE";
+    const failureEventType = isDeactivation ? "ACCOUNT_DEACTIVATION_FAILURE" : "ACCOUNT_ACTIVATION_FAILURE";
+    const successEventType = isDeactivation ? "ACCOUNT_DEACTIVATION_SUCCESS" : "ACCOUNT_ACTIVATION_SUCCESS";
 
     let connection;
     let transactionStarted = false;
@@ -49,7 +58,7 @@ function createDeactivateAccountHandler(databasePool) {
         await connection.rollback();
         transactionStarted = false;
         await writeFailedAccountAudit(databasePool, {
-          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          eventType: failureEventType,
           outcome: "FAILURE",
           actorUserId: req.user?.userId ?? null,
           actorRole: req.user?.role ?? null,
@@ -58,22 +67,29 @@ function createDeactivateAccountHandler(databasePool) {
         });
         return res.status(404).json({ message: "Account not found." });
       }
-      if (accounts[0].status !== "ACTIVE") {
+      if (accounts[0].status === targetStatus) {
         await connection.rollback();
         transactionStarted = false;
         await writeFailedAccountAudit(databasePool, {
-          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          eventType: failureEventType,
           outcome: "FAILURE",
           actorUserId: req.user?.userId ?? null,
           actorRole: req.user?.role ?? null,
           targetType: "account",
           targetId: accountNumber,
         });
-        return res.status(409).json({ message: "Account is already inactive." });
+        return res.status(409).json({
+          message: isDeactivation ? "Account is already inactive." : "Account is already active.",
+        });
       }
-      await connection.execute("UPDATE accounts SET status = 'INACTIVE' WHERE account_id = ?", [accounts[0].account_id]);
+      await connection.execute(
+        isDeactivation
+          ? "UPDATE accounts SET status = 'INACTIVE' WHERE account_id = ?"
+          : "UPDATE accounts SET status = 'ACTIVE' WHERE account_id = ?",
+        [accounts[0].account_id]
+      );
       await writeAuditEvent(connection, {
-        eventType: "ACCOUNT_DEACTIVATION_SUCCESS",
+        eventType: successEventType,
         outcome: "SUCCESS",
         actorUserId: req.user?.userId ?? null,
         actorRole: req.user?.role ?? null,
@@ -82,21 +98,40 @@ function createDeactivateAccountHandler(databasePool) {
       });
       await connection.commit();
       transactionStarted = false;
-      return res.status(200).json({ message: "Account deactivated.", accountNumber, status: "INACTIVE" });
+      return res.status(200).json({
+        message: isDeactivation ? "Account deactivated." : "Account activated.",
+        accountNumber,
+        status: targetStatus,
+        previousStatus: accounts[0].status,
+      });
     } catch (error) {
       if (connection && transactionStarted) {
         try {
           await connection.rollback();
         } catch (rollbackError) {
-          console.error("Account deactivation rollback failed:", rollbackError.code || "unknown error");
+          console.error("Account status transition rollback failed:", rollbackError.code || "unknown error");
         }
       }
-      console.error("Account deactivation failed:", error.code || "unknown error");
-      return res.status(500).json({ message: "Unable to deactivate the account." });
+      console.error("Account status transition failed:", error.code || "unknown error");
+      return res.status(500).json({
+        message: isDeactivation ? "Unable to deactivate the account." : "Unable to activate the account.",
+      });
     } finally {
       connection?.release();
     }
   };
+}
+
+function createDeactivateAccountHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, "INACTIVE");
+}
+
+function createActivateAccountHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, "ACTIVE");
+}
+
+function createUpdateAccountStatusHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, null);
 }
 
 function createAccountRouter(databasePool = pool) {
@@ -307,6 +342,18 @@ router.patch(
   createDeactivateAccountHandler(databasePool)
 );
 
+router.patch(
+  "/:accountNumber/activate",
+  requireRole("ADMIN", "STAFF"),
+  createActivateAccountHandler(databasePool)
+);
+
+router.patch(
+  "/:accountNumber/status",
+  requireRole("ADMIN", "STAFF"),
+  createUpdateAccountStatusHandler(databasePool)
+);
+
 router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
     ? req.body
@@ -478,3 +525,6 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
 module.exports = createAccountRouter();
 module.exports.createAccountRouter = createAccountRouter;
 module.exports.createDeactivateAccountHandler = createDeactivateAccountHandler;
+module.exports.createActivateAccountHandler = createActivateAccountHandler;
+module.exports.createUpdateAccountStatusHandler = createUpdateAccountStatusHandler;
+module.exports.createAccountStatusTransitionHandler = createAccountStatusTransitionHandler;

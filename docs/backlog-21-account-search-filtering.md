@@ -1,27 +1,22 @@
-﻿# Backlog 21: Account Search and Filtering
-
-## Summary
-Implemented account search and status filtering in the Bank Management System.
-
-## Features
-- Search accounts by account number.
-- Search accounts by customer name.
-- Filter accounts by ACTIVE and INACTIVE status.
-- Restrict customer users to their own accounts.
-- Validate search and status parameters.
-- Limit account-list results to 100 records.
+﻿# Backlog 21 – Account Search and Filtering
 
 ## Implementation
-- Frontend: `client/src/App.jsx`
-- Backend: `server/src/routes/accounts.js`
+- Search accounts by account number and customer name.
+- Filter accounts by ACTIVE and INACTIVE status.
+- Support customer-specific account filtering.
+- Validate search and filter parameters.
+- Limit results to 100 records.
 
-## Validation
-The backend automated test suite passed all 102 tests.
-The JavaScript syntax check passed.
+## Files Updated
+- client/src/App.jsx
+- server/src/routes/accounts.js
 
-## Implementation Commit
-`7e86163` — Implement account search and status filtering.
+## Testing
+- Node syntax validation passed.
+- All 102 automated tests passed.
+- Git diff whitespace validation passed.
 
-## Note
-The implementation commit is already present on `main`.
-This pull request records the completed backlog and does not re-merge the implementation.
+## Related Issues
+Closes #66
+Closes #67
+Closes #68

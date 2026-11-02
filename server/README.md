@@ -2,6 +2,15 @@
 
 Start the API from this directory with `npm run dev` for development or `npm start` for a regular local process. Configure MySQL through the existing environment variables; do not commit credentials.
 
+## Additional project documentation
+
+- [Architecture overview](../docs/architecture.md)
+- [Database schema](../docs/database-schema.md)
+- [API reference](../docs/api-reference.md)
+- [Configuration and setup](../docs/configuration-and-setup.md)
+- [Requirements traceability](../docs/requirements-traceability.md)
+- [Release readiness report](../docs/release-readiness.md)
+
 ## Environment configuration and setup
 
 The backend and frontend both use environment variables to keep configuration outside source control. The project reads server values from a local `.env` file in the `server/` directory, while the Vite frontend reads `VITE_*` values from a local environment file in `client/`.

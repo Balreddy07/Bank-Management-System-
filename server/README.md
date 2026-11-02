@@ -2,6 +2,114 @@
 
 Start the API from this directory with `npm run dev` for development or `npm start` for a regular local process. Configure MySQL through the existing environment variables; do not commit credentials.
 
+## Environment configuration and setup
+
+The backend and frontend both use environment variables to keep configuration outside source control. The project reads server values from a local `.env` file in the `server/` directory, while the Vite frontend reads `VITE_*` values from a local environment file in `client/`.
+
+### Required environment files
+
+- Copy `server/.env.example.template` to `server/.env` and fill in the local database credentials.
+- Copy `client/.env.example.template` to `client/.env` or `client/.env.development` if you need a frontend-specific API URL.
+- Keep the real `.env` files local-only; they are ignored by Git and must never be committed.
+- Do not modify or overwrite the existing untracked `server/.env.example` file.
+
+### Required values
+
+```sh
+# server/.env
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=app_user
+DB_PASSWORD=your-local-password
+DB_NAME=bank_management_system
+SESSION_SECRET=replace-with-a-random-32-character-secret
+PORT=5000
+NODE_ENV=development
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+SESSION_COOKIE_SECURE=false
+SESSION_COOKIE_SAME_SITE=lax
+LOGIN_RATE_LIMIT=20
+```
+
+```sh
+# client/.env
+VITE_API_BASE=/api
+```
+
+The application validates required values during startup. Missing `DB_USER`, `DB_NAME`, or invalid `DB_PORT` values fail fast with clear, sanitized errors. No secrets are printed to logs.
+
+### Prerequisites
+
+- Node.js 20 LTS or newer is recommended for this repository.
+- npm 10 or newer.
+- MySQL 8.0.16 or later, or another MySQL-compatible server that matches the configured schema.
+- A new empty database for local development before running `npm run migrate`.
+
+### Local installation
+
+```sh
+# from the repository root
+cd server && npm install
+cd ../client && npm install
+```
+
+### Database initialization
+
+1. Create a local database in MySQL, for example:
+
+```sql
+CREATE DATABASE bank_management_system
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+2. Update the `server/.env` values with the database host, port, username, password, and database name.
+3. Run the migrations:
+
+```sh
+cd server
+npm run migrate
+```
+
+For a clean local setup, do not overwrite an existing database without a verified backup.
+
+### Application startup
+
+```sh
+# backend
+cd server
+npm run dev
+```
+
+```sh
+# frontend (separate terminal)
+cd client
+npm run dev
+```
+
+Expected defaults:
+
+- Backend: `http://localhost:5000`
+- Frontend: `http://localhost:5173`
+- Vite uses the `/api` proxy by default, which routes requests to the Express server.
+
+To verify the services started successfully:
+
+```sh
+curl http://localhost:5000/api/health
+```
+
+and confirm the React app loads at `http://localhost:5173`.
+
+### Troubleshooting
+
+- Missing environment variables: confirm the local `.env` file exists and contains all required values.
+- Invalid database credentials: verify `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, and `DB_NAME` match the MySQL instance.
+- Database unavailable: confirm the MySQL service is started and reachable from the configured host and port.
+- Port already in use: update `PORT` or stop the current process listening on that port.
+- Frontend connection problems: ensure `VITE_API_BASE` points to the correct backend URL or leave it as `/api` for the local proxy.
+- Migration failures: review the reported validation errors, back up the database if needed, and fix the underlying schema or data issue before rerunning `npm run migrate`.
+
 ## Authentication setup
 
 Authentication uses bcrypt password hashes, HTTP-only `SameSite=Lax` session cookies, and a MySQL-backed `user_sessions` table. Sessions expire after 30 minutes of inactivity; each authenticated request refreshes that sliding timeout. There is no separate absolute session lifetime. Expiration is enforced by the session store when the request arrives, and an expired record encountered during lookup is deleted without affecting other sessions.

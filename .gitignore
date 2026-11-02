@@ -14,6 +14,10 @@ client/dist/
 *.log
 npm-debug.log*
 
+# Local database backups
+bank-management-system-backups/
+**/bank-management-system-backups/
+
 # Temporary audit report
 server/audit-report.json
 

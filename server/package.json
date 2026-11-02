@@ -15,7 +15,9 @@
     "migrate": "node src/scripts/migrate.js",
     "migrate:status": "node src/scripts/migrate.js --status",
     "initialize-admin": "node src/scripts/initialize-admin.js",
-    "reset-admin-password": "node src/scripts/reset-admin-password.js"
+    "reset-admin-password": "node src/scripts/reset-admin-password.js",
+    "backup:db": "node src/scripts/backup-recovery.js backup",
+    "restore:db": "node src/scripts/backup-recovery.js restore"
   },
   "keywords": [],
   "author": "",

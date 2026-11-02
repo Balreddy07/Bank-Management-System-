@@ -28,12 +28,21 @@ async function writeFailedAccountAudit(databasePool, event) {
   }
 }
 
-function createDeactivateAccountHandler(databasePool) {
+function createAccountStatusTransitionHandler(databasePool, fixedTargetStatus = null) {
   return async (req, res) => {
     const { accountNumber } = req.params;
     if (!isValidAccountNumber(accountNumber) || req.body?.confirm !== true) {
       return res.status(400).json({ message: "Provide a valid account number and explicit confirmation." });
     }
+
+    const requestedStatus = fixedTargetStatus || req.body?.status;
+    if (typeof requestedStatus !== "string" || !["ACTIVE", "INACTIVE"].includes(requestedStatus.toUpperCase())) {
+      return res.status(400).json({ message: "Target status must be ACTIVE or INACTIVE." });
+    }
+    const targetStatus = requestedStatus.toUpperCase();
+    const isDeactivation = targetStatus === "INACTIVE";
+    const failureEventType = isDeactivation ? "ACCOUNT_DEACTIVATION_FAILURE" : "ACCOUNT_ACTIVATION_FAILURE";
+    const successEventType = isDeactivation ? "ACCOUNT_DEACTIVATION_SUCCESS" : "ACCOUNT_ACTIVATION_SUCCESS";
 
     let connection;
     let transactionStarted = false;
@@ -49,7 +58,7 @@ function createDeactivateAccountHandler(databasePool) {
         await connection.rollback();
         transactionStarted = false;
         await writeFailedAccountAudit(databasePool, {
-          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          eventType: failureEventType,
           outcome: "FAILURE",
           actorUserId: req.user?.userId ?? null,
           actorRole: req.user?.role ?? null,
@@ -58,22 +67,29 @@ function createDeactivateAccountHandler(databasePool) {
         });
         return res.status(404).json({ message: "Account not found." });
       }
-      if (accounts[0].status !== "ACTIVE") {
+      if (accounts[0].status === targetStatus) {
         await connection.rollback();
         transactionStarted = false;
         await writeFailedAccountAudit(databasePool, {
-          eventType: "ACCOUNT_DEACTIVATION_FAILURE",
+          eventType: failureEventType,
           outcome: "FAILURE",
           actorUserId: req.user?.userId ?? null,
           actorRole: req.user?.role ?? null,
           targetType: "account",
           targetId: accountNumber,
         });
-        return res.status(409).json({ message: "Account is already inactive." });
+        return res.status(409).json({
+          message: isDeactivation ? "Account is already inactive." : "Account is already active.",
+        });
       }
-      await connection.execute("UPDATE accounts SET status = 'INACTIVE' WHERE account_id = ?", [accounts[0].account_id]);
+      await connection.execute(
+        isDeactivation
+          ? "UPDATE accounts SET status = 'INACTIVE' WHERE account_id = ?"
+          : "UPDATE accounts SET status = 'ACTIVE' WHERE account_id = ?",
+        [accounts[0].account_id]
+      );
       await writeAuditEvent(connection, {
-        eventType: "ACCOUNT_DEACTIVATION_SUCCESS",
+        eventType: successEventType,
         outcome: "SUCCESS",
         actorUserId: req.user?.userId ?? null,
         actorRole: req.user?.role ?? null,
@@ -82,21 +98,40 @@ function createDeactivateAccountHandler(databasePool) {
       });
       await connection.commit();
       transactionStarted = false;
-      return res.status(200).json({ message: "Account deactivated.", accountNumber, status: "INACTIVE" });
+      return res.status(200).json({
+        message: isDeactivation ? "Account deactivated." : "Account activated.",
+        accountNumber,
+        status: targetStatus,
+        previousStatus: accounts[0].status,
+      });
     } catch (error) {
       if (connection && transactionStarted) {
         try {
           await connection.rollback();
         } catch (rollbackError) {
-          console.error("Account deactivation rollback failed:", rollbackError.code || "unknown error");
+          console.error("Account status transition rollback failed:", rollbackError.code || "unknown error");
         }
       }
-      console.error("Account deactivation failed:", error.code || "unknown error");
-      return res.status(500).json({ message: "Unable to deactivate the account." });
+      console.error("Account status transition failed:", error.code || "unknown error");
+      return res.status(500).json({
+        message: isDeactivation ? "Unable to deactivate the account." : "Unable to activate the account.",
+      });
     } finally {
       connection?.release();
     }
   };
+}
+
+function createDeactivateAccountHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, "INACTIVE");
+}
+
+function createActivateAccountHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, "ACTIVE");
+}
+
+function createUpdateAccountStatusHandler(databasePool) {
+  return createAccountStatusTransitionHandler(databasePool, null);
 }
 
 function createAccountRouter(databasePool = pool) {
@@ -136,59 +171,91 @@ function createAccountRouter(databasePool = pool) {
       return res.status(500).json({ message: "Unable to retrieve account details." });
     }
   });
-
   router.get("/", async (req, res) => {
-  try {
-    const rawSearch = req.query.search === undefined ? "" : req.query.search;
-    if (typeof rawSearch !== "string") {
-      return res.status(400).json({ message: "Search must be a text value of 100 characters or fewer." });
-    }
-    const search = rawSearch.trim();
+    try {
+      const rawSearch =
+        req.query.search === undefined ? "" : req.query.search;
+      const rawStatus =
+        req.query.status === undefined ? "" : req.query.status;
 
-    if (Array.from(search).length > 100 || /\p{Cc}/u.test(search)) {
-      return res.status(400).json({
-        message: "Search must be 100 characters or fewer.",
+      // Validate the status filter.
+      if (
+        typeof rawStatus !== "string" ||
+        !["", "ACTIVE", "INACTIVE"].includes(rawStatus)
+      ) {
+        return res.status(400).json({
+          message: "Status must be ACTIVE or INACTIVE.",
+        });
+      }
+
+      // Validate the search input.
+      if (typeof rawSearch !== "string") {
+        return res.status(400).json({
+          message: "Search must be a text value of 100 characters or fewer.",
+        });
+      }
+
+      const search = rawSearch.trim();
+
+      if (Array.from(search).length > 100 || /\p{Cc}/u.test(search)) {
+        return res.status(400).json({
+          message: "Search must be 100 characters or fewer.",
+        });
+      }
+
+      const searchPattern = `%${search}%`;
+      const customerId =
+        req.user?.role === "CUSTOMER" ? req.user.customerId : null;
+
+      // Search by account number or customer name, apply the status
+      // filter, and restrict customer users to their own accounts.
+      const [accounts] = await databasePool.execute(
+        `SELECT
+           a.account_id AS accountId,
+           a.account_number AS accountNumber,
+           a.balance,
+           a.status,
+           a.created_at AS createdAt,
+           c.customer_id AS customerId,
+           c.full_name AS fullName,
+           c.address,
+           c.phone
+         FROM accounts a
+         INNER JOIN customers c
+           ON c.customer_id = a.customer_id
+         WHERE (
+           ? = ''
+           OR a.account_number LIKE ?
+           OR c.full_name LIKE ?
+         )
+           AND (? IS NULL OR c.customer_id = ?)
+           AND (? = '' OR a.status = ?)
+         ORDER BY a.created_at DESC
+         LIMIT 100`,
+        [
+          search,
+          searchPattern,
+          searchPattern,
+          customerId,
+          customerId,
+          rawStatus,
+          rawStatus,
+        ]
+      );
+
+      return res.status(200).json({ accounts });
+    } catch (error) {
+      console.error(
+        "Account listing failed:",
+        error.code || "unknown error"
+      );
+
+      return res.status(500).json({
+        message: "Unable to retrieve accounts.",
       });
     }
+  });
 
-    const searchPattern = `%${search}%`;
-
-    const [accounts] = await databasePool.execute(
-      `SELECT
-         a.account_id AS accountId,
-         a.account_number AS accountNumber,
-         a.balance,
-         a.status,
-         a.created_at AS createdAt,
-         c.customer_id AS customerId,
-         c.full_name AS fullName,
-         c.address,
-         c.phone
-       FROM accounts a
-       INNER JOIN customers c ON c.customer_id = a.customer_id
-       WHERE (? = ''
-          OR a.account_number LIKE ?
-          OR c.full_name LIKE ?)
-         AND (? IS NULL OR c.customer_id = ?)
-       ORDER BY a.created_at DESC
-       LIMIT 100`,
-      [
-        search,
-        searchPattern,
-        searchPattern,
-        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
-        req.user?.role === "CUSTOMER" ? req.user.customerId : null,
-      ]
-    );
-
-    return res.status(200).json({ accounts });
-  } catch (error) {
-    console.error("Account listing failed:", error.code || "unknown error");
-    return res.status(500).json({
-      message: "Unable to retrieve accounts.",
-    });
-  }
-});
 
 router.patch("/:accountNumber", requireRole("ADMIN", "STAFF"), async (req, res) => {
   const { accountNumber } = req.params;
@@ -275,10 +342,23 @@ router.patch(
   createDeactivateAccountHandler(databasePool)
 );
 
+router.patch(
+  "/:accountNumber/activate",
+  requireRole("ADMIN", "STAFF"),
+  createActivateAccountHandler(databasePool)
+);
+
+router.patch(
+  "/:accountNumber/status",
+  requireRole("ADMIN", "STAFF"),
+  createUpdateAccountStatusHandler(databasePool)
+);
+
 router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
-  if (!isRecord(req.body)) {
-    return res.status(400).json({ message: "All customer and KYC fields are required." });
-  }
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body
+    : {};
+
   const {
     fullName: submittedFullName,
     address: submittedAddress,
@@ -286,7 +366,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     idProofType: submittedIdProofType,
     idProofNumber: submittedIdProofNumber,
     initialDeposit,
-  } = req.body;
+  } = body;
+
   const fullName = normalizeText(submittedFullName, 100);
   const address = normalizeText(submittedAddress, 255);
   const idProofType = normalizeText(submittedIdProofType, 30);
@@ -299,8 +380,8 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
     !address ||
     !normalizedPhone ||
     !idProofType ||
-    !/^[A-Za-z][A-Za-z0-9 _-]*$/.test(idProofType) ||
-    !idProofNumber
+    !idProofNumber ||
+    !/^[A-Za-z][A-Za-z0-9 _-]*$/.test(idProofType)
   ) {
     return res.status(400).json({
       message: "All customer and KYC fields are required.",
@@ -312,6 +393,7 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
       message: "Initial deposit must be at least ₹500.",
     });
   }
+
   const initialDepositValue = formatMoneyCents(initialDepositCents);
 
   let connection;
@@ -443,3 +525,6 @@ router.post("/", requireRole("ADMIN", "STAFF"), async (req, res) => {
 module.exports = createAccountRouter();
 module.exports.createAccountRouter = createAccountRouter;
 module.exports.createDeactivateAccountHandler = createDeactivateAccountHandler;
+module.exports.createActivateAccountHandler = createActivateAccountHandler;
+module.exports.createUpdateAccountStatusHandler = createUpdateAccountStatusHandler;
+module.exports.createAccountStatusTransitionHandler = createAccountStatusTransitionHandler;

@@ -92,6 +92,7 @@ export default function App() {
   const [form, setForm] = useState(initialForm);
   const [accounts, setAccounts] = useState([]);
   const [accountSearch, setAccountSearch] = useState("");
+  const [accountStatusFilter, setAccountStatusFilter] = useState("");
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountDetails, setAccountDetails] = useState(null);
   const [accountDetailsLoading, setAccountDetailsLoading] = useState(false);
@@ -155,6 +156,7 @@ export default function App() {
   function clearProtectedData() {
     setAccounts([]);
     setAccountSearch("");
+    setAccountStatusFilter("");
     setAccountDetails(null);
     setEditingAccount(false);
     selectedAccountNumberRef.current = "";
@@ -232,6 +234,9 @@ export default function App() {
         if (activeTab === "Accounts" && accountSearch.trim()) {
           params.set("search", accountSearch.trim());
         }
+        if (activeTab === "Accounts" && accountStatusFilter) {
+          params.set("status", accountStatusFilter);
+        }
 
         const response = await apiFetch(
           `/accounts?${params.toString()}`,
@@ -263,7 +268,7 @@ export default function App() {
 
     loadAccounts();
     return () => controller.abort();
-  }, [activeTab, accountSearch, authStatus]);
+  }, [activeTab, accountSearch, accountStatusFilter, authStatus]);
 
   useEffect(() => {
     if (activeTab !== "Transactions" || !selectedAccountNumber) {
@@ -747,6 +752,10 @@ export default function App() {
     }
   }
 
+  function requestAccountDeactivation(accountNumber) {
+    setDeactivationTarget({ accountNumber, loading: false });
+  }
+
   async function confirmAccountDeactivation() {
     if (!deactivationTarget) return;
     const { accountNumber } = deactivationTarget;
@@ -772,10 +781,26 @@ export default function App() {
     }
   }
 
-  function requestAccountDeactivation(accountNumber) {
-    setDeactivationTarget({ accountNumber, loading: false });
+  async function activateAccount(accountNumber) {
+    if (!window.confirm(`Activate account ${accountNumber}? Further transactions will be permitted.`)) return;
+    try {
+      const response = await apiFetch(`/accounts/${accountNumber}/activate`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      const data = await readApiResponse(response, "Could not activate account.");
+      setAccounts((previous) => previous.map((account) =>
+        account.accountNumber === accountNumber ? { ...account, status: data.status } : account
+      ));
+      setAccountDetails((previous) =>
+        previous?.accountNumber === accountNumber ? { ...previous, status: data.status } : previous
+      );
+      setNotice({ type: "success", text: data.message });
+    } catch (error) {
+      setNotice({ type: "error", text: getUserErrorMessage(error, "Could not activate account.") });
+    }
   }
-
   if (authStatus === "checking") {
     return (
       <div className="auth-loading" role="status">
@@ -1121,6 +1146,30 @@ export default function App() {
                 )}
               </div>
 
+              <div className="directory-filter-row">
+                <label className="directory-status-filter">
+                  <span>Status</span>
+                  <select
+                    value={accountStatusFilter}
+                    onChange={(event) => setAccountStatusFilter(event.target.value)}
+                    aria-label="Filter accounts by status"
+                  >
+                    <option value="">All statuses</option>
+                    <option value="ACTIVE">Active</option>
+                    <option value="INACTIVE">Inactive</option>
+                  </select>
+                </label>
+                {accountStatusFilter && (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => setAccountStatusFilter("")}
+                  >
+                    Clear status filter
+                  </button>
+                )}
+              </div>
+
               <div className="table-card">
                 {accountsLoading ? (
                   <div className="table-message">Loading accounts...</div>
@@ -1207,6 +1256,13 @@ export default function App() {
                                   >
                                     {deactivationTarget?.accountNumber === account.accountNumber ? "Confirming..." : "Deactivate"}
                                   </button>
+                                )}
+                                {currentUser.role !== "CUSTOMER" && account.status === "INACTIVE" && (
+                                  <button
+                                    className="table-action table-action-success"
+                                    type="button"
+                                    onClick={() => activateAccount(account.accountNumber)}
+                                  >Activate</button>
                                 )}
                               </div>
                             </td>
@@ -1385,6 +1441,12 @@ export default function App() {
                       </span>
                     )}
                   </div>
+
+                  {selectedAccountNumber && transactionAccount?.status === "INACTIVE" && (
+                    <div className="transaction-inactive-warning" role="alert">
+                      Transactions are not allowed for an inactive account.
+                    </div>
+                  )}
 
                   <div className="transaction-mode" role="group" aria-label="Transaction type">
                     <button

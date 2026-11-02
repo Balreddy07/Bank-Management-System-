@@ -846,6 +846,69 @@
   cursor: pointer;
 }
 
+.form-field.field-error input,
+.form-field.field-error select,
+.form-field.field-error .currency-input {
+  border-color: #d66060;
+  box-shadow: 0 0 0 3px rgba(214, 96, 96, 0.09);
+}
+
+.field-error-text {
+  color: #b63d3d;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(19, 27, 40, 0.55);
+}
+
+.confirm-dialog {
+  width: min(440px, 100%);
+  padding: 26px 24px 20px;
+  border: 1px solid #e8edf6;
+  border-radius: 14px;
+  background: white;
+  box-shadow: 0 22px 60px rgba(19, 27, 40, 0.22);
+}
+
+.confirm-dialog h3 {
+  margin: 0 0 10px;
+  color: #1e2d45;
+  font-size: 18px;
+  letter-spacing: -0.5px;
+}
+
+.confirm-dialog p {
+  margin: 0;
+  color: #5f7088;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.danger-button {
+  background: #c94d4d;
+  color: white;
+}
+
+.danger-button:hover {
+  background: #b63f3f;
+}
+
 .section-divider {
   margin: 27px 0 23px;
 }
@@ -2970,6 +3033,69 @@
 
 .form-field select {
   cursor: pointer;
+}
+
+.form-field.field-error input,
+.form-field.field-error select,
+.form-field.field-error .currency-input {
+  border-color: #d66060;
+  box-shadow: 0 0 0 3px rgba(214, 96, 96, 0.09);
+}
+
+.field-error-text {
+  color: #b63d3d;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(19, 27, 40, 0.55);
+}
+
+.confirm-dialog {
+  width: min(440px, 100%);
+  padding: 26px 24px 20px;
+  border: 1px solid #e8edf6;
+  border-radius: 14px;
+  background: white;
+  box-shadow: 0 22px 60px rgba(19, 27, 40, 0.22);
+}
+
+.confirm-dialog h3 {
+  margin: 0 0 10px;
+  color: #1e2d45;
+  font-size: 18px;
+  letter-spacing: -0.5px;
+}
+
+.confirm-dialog p {
+  margin: 0;
+  color: #5f7088;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.danger-button {
+  background: #c94d4d;
+  color: white;
+}
+
+.danger-button:hover {
+  background: #b63f3f;
 }
 
 .section-divider {

@@ -122,10 +122,16 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [createdAccount, setCreatedAccount] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [accountFormErrors, setAccountFormErrors] = useState({});
+  const [accountEditErrors, setAccountEditErrors] = useState({});
+  const [transactionErrors, setTransactionErrors] = useState({});
+  const [staffFormErrors, setStaffFormErrors] = useState({});
+  const [customerUserErrors, setCustomerUserErrors] = useState({});
   const [staff, setStaff] = useState([]);
   const [staffLoading, setStaffLoading] = useState(false);
   const [staffForm, setStaffForm] = useState({ username: "", password: "", role: "STAFF" });
   const [customerUserForm, setCustomerUserForm] = useState({ customerId: "", username: "", password: "" });
+  const [deactivationTarget, setDeactivationTarget] = useState(null);
 
   async function apiFetch(path, options = {}) {
     let response;
@@ -406,6 +412,47 @@ export default function App() {
   function updateField(event) {
     const { name, value } = event.target;
     setForm((previous) => ({ ...previous, [name]: value }));
+    if (accountFormErrors[name]) {
+      setAccountFormErrors((previous) => ({ ...previous, [name]: "" }));
+    }
+  }
+
+  function validateAccountForm() {
+    const errors = {};
+    const fullName = form.fullName.trim();
+    const address = form.address.trim();
+    const phone = form.phone.trim();
+    const idProofNumber = form.idProofNumber.trim();
+    const deposit = Number(form.initialDeposit);
+
+    if (!fullName) {
+      errors.fullName = "Enter the customer's full name.";
+    } else if (fullName.length < 2) {
+      errors.fullName = "Full name must be at least 2 characters.";
+    }
+
+    if (!phone) {
+      errors.phone = "Enter the phone number.";
+    } else if (!/^\+?[0-9\s()-]{8,20}$/.test(phone)) {
+      errors.phone = "Use a valid phone number.";
+    }
+
+    if (!address) {
+      errors.address = "Enter the residential address.";
+    } else if (address.length < 8) {
+      errors.address = "Address is too short to be valid.";
+    }
+
+    if (!idProofNumber) {
+      errors.idProofNumber = "Enter the identification number.";
+    }
+
+    if (!Number.isFinite(deposit) || deposit < 500) {
+      errors.initialDeposit = "The minimum initial deposit is ₹500.";
+    }
+
+    setAccountFormErrors(errors);
+    return Object.keys(errors).length === 0;
   }
 
   async function createAccount(event) {
@@ -413,13 +460,7 @@ export default function App() {
     setNotice(null);
     setCreatedAccount(null);
 
-    const deposit = Number(form.initialDeposit);
-
-    if (!Number.isFinite(deposit) || deposit < 500) {
-      setNotice({
-        type: "error",
-        text: "The minimum initial deposit is ₹500.",
-      });
+    if (!validateAccountForm()) {
       return;
     }
 
@@ -468,20 +509,20 @@ export default function App() {
     setNotice(null);
     setTransactionResult(null);
 
+    const errors = {};
     const accountNumber = selectedAccountNumber;
-    if (!selectedAccountNumber || transactionAccount?.status !== "ACTIVE") {
-      setNotice({ type: "error", text: "Choose an active account to continue." });
-      return;
+    if (!selectedAccountNumber) {
+      errors.account = "Select an account to continue.";
+    } else if (transactionAccount?.status !== "ACTIVE") {
+      errors.account = "Choose an active account to continue.";
     }
 
     if (!/^\d+(?:\.\d{1,2})?$/.test(transactionAmount) || Number(transactionAmount) <= 0) {
-      setNotice({ type: "error", text: "Enter an amount greater than zero with up to two decimal places." });
-      return;
+      errors.amount = "Enter an amount greater than zero with up to two decimal places.";
     }
 
-    if (transactionMode === "WITHDRAWAL" && !window.confirm(
-      `Withdraw ${money(transactionAmount)} from account ${selectedAccountNumber}?`
-    )) {
+    setTransactionErrors(errors);
+    if (Object.keys(errors).length > 0) {
       return;
     }
 
@@ -538,6 +579,22 @@ export default function App() {
   async function createStaff(event) {
     event.preventDefault();
     setNotice(null);
+
+    const errors = {};
+    if (!staffForm.username.trim()) {
+      errors.username = "Enter a username.";
+    } else if (staffForm.username.trim().length < 3) {
+      errors.username = "Username must be at least 3 characters.";
+    }
+    if (!staffForm.password || staffForm.password.length < 8) {
+      errors.password = "Password must be at least 8 characters.";
+    }
+
+    setStaffFormErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      return;
+    }
+
     try {
       const response = await apiFetch("/admin/staff", {
         method: "POST",
@@ -547,6 +604,7 @@ export default function App() {
       const data = await readApiResponse(response, "Could not create staff account.");
       setNotice({ type: "success", text: data.message });
       setStaffForm({ username: "", password: "", role: "STAFF" });
+      setStaffFormErrors({});
       try {
         const refreshed = await apiFetch("/admin/staff");
         if (refreshed.ok) {
@@ -566,6 +624,23 @@ export default function App() {
   async function createCustomerUser(event) {
     event.preventDefault();
     setNotice(null);
+
+    const errors = {};
+    if (!customerUserForm.customerId) {
+      errors.customerId = "Select a customer.";
+    }
+    if (!customerUserForm.username.trim()) {
+      errors.username = "Enter a customer username.";
+    }
+    if (!customerUserForm.password || customerUserForm.password.length < 8) {
+      errors.password = "Password must be at least 8 characters.";
+    }
+
+    setCustomerUserErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      return;
+    }
+
     try {
       const response = await apiFetch("/admin/customer-users", {
         method: "POST",
@@ -578,6 +653,7 @@ export default function App() {
       const data = await readApiResponse(response, "Could not create customer sign-in.");
       setNotice({ type: "success", text: data.message });
       setCustomerUserForm({ customerId: "", username: "", password: "" });
+      setCustomerUserErrors({});
     } catch (error) {
       setNotice({ type: "error", text: getUserErrorMessage(error, "Could not create customer sign-in.") });
     }
@@ -607,6 +683,7 @@ export default function App() {
       address: account.address,
       phone: account.phone,
     });
+    setAccountEditErrors({});
     setEditingAccount(true);
     setNotice(null);
   }
@@ -614,6 +691,25 @@ export default function App() {
   async function saveAccountEdit(event) {
     event.preventDefault();
     if (!accountDetails) return;
+
+    const errors = {};
+    if (!accountEditForm.fullName.trim()) {
+      errors.fullName = "Full name is required.";
+    }
+    if (!accountEditForm.phone.trim()) {
+      errors.phone = "Phone number is required.";
+    } else if (!/^\+?[0-9\s()-]{8,20}$/.test(accountEditForm.phone.trim())) {
+      errors.phone = "Use a valid phone number.";
+    }
+    if (!accountEditForm.address.trim()) {
+      errors.address = "Address is required.";
+    }
+
+    setAccountEditErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      return;
+    }
+
     setAccountEditLoading(true);
     setNotice(null);
     try {
@@ -630,6 +726,7 @@ export default function App() {
           : account
       ));
       setEditingAccount(false);
+      setAccountEditErrors({});
       setNotice({ type: "success", text: data.message });
     } catch (error) {
       setNotice({ type: "error", text: getUserErrorMessage(error, "Could not update customer details.") });
@@ -655,8 +752,14 @@ export default function App() {
     }
   }
 
-  async function deactivateAccount(accountNumber) {
-    if (!window.confirm(`Deactivate account ${accountNumber}? Further transactions will be blocked.`)) return;
+  function requestAccountDeactivation(accountNumber) {
+    setDeactivationTarget({ accountNumber, loading: false });
+  }
+
+  async function confirmAccountDeactivation() {
+    if (!deactivationTarget) return;
+    const { accountNumber } = deactivationTarget;
+    setDeactivationTarget({ accountNumber, loading: true });
     try {
       const response = await apiFetch(`/accounts/${accountNumber}/deactivate`, {
         method: "PATCH",
@@ -671,8 +774,10 @@ export default function App() {
         previous?.accountNumber === accountNumber ? { ...previous, status: data.status } : previous
       );
       setNotice({ type: "success", text: data.message });
+      setDeactivationTarget(null);
     } catch (error) {
       setNotice({ type: "error", text: getUserErrorMessage(error, "Could not deactivate account.") });
+      setDeactivationTarget({ accountNumber, loading: false });
     }
   }
 
@@ -696,8 +801,6 @@ export default function App() {
       setNotice({ type: "error", text: getUserErrorMessage(error, "Could not activate account.") });
     }
   }
-
-
   if (authStatus === "checking") {
     return (
       <div className="auth-loading" role="status">
@@ -722,9 +825,41 @@ export default function App() {
     return item.name === "Accounts" || item.name === "Transactions";
   });
 
+  const deactivationPending = Boolean(deactivationTarget);
+
   return (
-    <div className="bank-app">
-      <aside className="sidebar">
+    <>
+      {deactivationPending && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="deactivate-account-title">
+          <div className="confirm-dialog">
+            <h3 id="deactivate-account-title">Deactivate account {deactivationTarget.accountNumber}?</h3>
+            <p>
+              This action will mark the account as inactive and block further transaction activity until it is restored by an administrator.
+            </p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setDeactivationTarget(null)}
+                disabled={deactivationTarget.loading}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary-button danger-button"
+                onClick={confirmAccountDeactivation}
+                disabled={deactivationTarget.loading}
+              >
+                {deactivationTarget.loading ? "Deactivating..." : "Confirm deactivation"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="bank-app">
+        <aside className="sidebar">
         <button className="brand" onClick={() => navigate("Dashboard")}>
           <span className="brand-mark">S</span>
           <span className="brand-copy">
@@ -859,7 +994,7 @@ export default function App() {
                 <div className="form-divider" />
 
                 <div className="form-grid">
-                  <FormField label="Full name" required>
+                  <FormField label="Full name" required error={accountFormErrors.fullName}>
                     <input
                       name="fullName"
                       value={form.fullName}
@@ -868,10 +1003,11 @@ export default function App() {
                       maxLength={100}
                       autoComplete="name"
                       required
+                      aria-invalid={Boolean(accountFormErrors.fullName)}
                     />
                   </FormField>
 
-                  <FormField label="Phone number" required>
+                  <FormField label="Phone number" required error={accountFormErrors.phone}>
                     <input
                       name="phone"
                       type="tel"
@@ -881,10 +1017,11 @@ export default function App() {
                       autoComplete="tel"
                       maxLength={20}
                       required
+                      aria-invalid={Boolean(accountFormErrors.phone)}
                     />
                   </FormField>
 
-                  <FormField label="Residential address" required wide>
+                  <FormField label="Residential address" required wide error={accountFormErrors.address}>
                     <input
                       name="address"
                       value={form.address}
@@ -893,6 +1030,7 @@ export default function App() {
                       maxLength={255}
                       autoComplete="street-address"
                       required
+                      aria-invalid={Boolean(accountFormErrors.address)}
                     />
                   </FormField>
 
@@ -911,7 +1049,7 @@ export default function App() {
                     </select>
                   </FormField>
 
-                  <FormField label="Identification number" required>
+                  <FormField label="Identification number" required error={accountFormErrors.idProofNumber}>
                     <input
                       name="idProofNumber"
                       value={form.idProofNumber}
@@ -919,6 +1057,7 @@ export default function App() {
                       placeholder="Enter ID proof number"
                       maxLength={100}
                       required
+                      aria-invalid={Boolean(accountFormErrors.idProofNumber)}
                     />
                   </FormField>
                 </div>
@@ -934,7 +1073,7 @@ export default function App() {
                 </div>
 
                 <div className="deposit-box">
-                  <FormField label="Initial deposit amount (INR)" required>
+                  <FormField label="Initial deposit amount (INR)" required error={accountFormErrors.initialDeposit}>
                     <div className="currency-input">
                       <span>₹</span>
                       <input
@@ -946,6 +1085,7 @@ export default function App() {
                         max="9999999999.99"
                         step="0.01"
                         required
+                        aria-invalid={Boolean(accountFormErrors.initialDeposit)}
                       />
                     </div>
                     <small className="field-hint">
@@ -1111,8 +1251,11 @@ export default function App() {
                                   <button
                                     className="table-action table-action-danger"
                                     type="button"
-                                    onClick={() => deactivateAccount(account.accountNumber)}
-                                  >Deactivate</button>
+                                    disabled={deactivationTarget?.accountNumber === account.accountNumber}
+                                    onClick={() => requestAccountDeactivation(account.accountNumber)}
+                                  >
+                                    {deactivationTarget?.accountNumber === account.accountNumber ? "Confirming..." : "Deactivate"}
+                                  </button>
                                 )}
                                 {currentUser.role !== "CUSTOMER" && account.status === "INACTIVE" && (
                                   <button
@@ -1147,29 +1290,47 @@ export default function App() {
                   {editingAccount && currentUser.role !== "CUSTOMER" ? (
                     <form onSubmit={saveAccountEdit}>
                       <div className="form-grid">
-                        <FormField label="Full name" required>
+                        <FormField label="Full name" required error={accountEditErrors.fullName}>
                           <input
                             value={accountEditForm.fullName}
-                            onChange={(event) => setAccountEditForm((previous) => ({ ...previous, fullName: event.target.value }))}
+                            onChange={(event) => {
+                              setAccountEditForm((previous) => ({ ...previous, fullName: event.target.value }));
+                              if (accountEditErrors.fullName) {
+                                setAccountEditErrors((previous) => ({ ...previous, fullName: "" }));
+                              }
+                            }}
                             maxLength={100}
                             required
+                            aria-invalid={Boolean(accountEditErrors.fullName)}
                           />
                         </FormField>
-                        <FormField label="Phone number" required>
+                        <FormField label="Phone number" required error={accountEditErrors.phone}>
                           <input
                             type="tel"
                             value={accountEditForm.phone}
-                            onChange={(event) => setAccountEditForm((previous) => ({ ...previous, phone: event.target.value }))}
+                            onChange={(event) => {
+                              setAccountEditForm((previous) => ({ ...previous, phone: event.target.value }));
+                              if (accountEditErrors.phone) {
+                                setAccountEditErrors((previous) => ({ ...previous, phone: "" }));
+                              }
+                            }}
                             maxLength={20}
                             required
+                            aria-invalid={Boolean(accountEditErrors.phone)}
                           />
                         </FormField>
-                        <FormField label="Residential address" required wide>
+                        <FormField label="Residential address" required wide error={accountEditErrors.address}>
                           <input
                             value={accountEditForm.address}
-                            onChange={(event) => setAccountEditForm((previous) => ({ ...previous, address: event.target.value }))}
+                            onChange={(event) => {
+                              setAccountEditForm((previous) => ({ ...previous, address: event.target.value }));
+                              if (accountEditErrors.address) {
+                                setAccountEditErrors((previous) => ({ ...previous, address: "" }));
+                              }
+                            }}
                             maxLength={255}
                             required
+                            aria-invalid={Boolean(accountEditErrors.address)}
                           />
                         </FormField>
                       </div>
@@ -1242,7 +1403,7 @@ export default function App() {
 
                   <div className="form-divider" />
 
-                  <FormField label="Account" required>
+                  <FormField label="Account" required error={transactionErrors.account}>
                     <select
                       value={selectedAccountNumber}
                       onChange={(event) => {
@@ -1251,8 +1412,10 @@ export default function App() {
                         setSelectedAccountNumber(nextAccountNumber);
                         setTransactionResult(null);
                         setNotice(null);
+                        setTransactionErrors((previous) => ({ ...previous, account: "" }));
                       }}
                       required
+                      aria-invalid={Boolean(transactionErrors.account)}
                     >
                       <option value="">Select an account</option>
                       {accounts.map((account) => (
@@ -1304,7 +1467,7 @@ export default function App() {
                     </button>
                   </div>
 
-                  <FormField label="Amount (INR)" required>
+                  <FormField label="Amount (INR)" required error={transactionErrors.amount}>
                     <div className="currency-input">
                       <span>₹</span>
                       <input
@@ -1314,9 +1477,15 @@ export default function App() {
                         max="9999999999.99"
                         step="0.01"
                         value={transactionAmount}
-                        onChange={(event) => setTransactionAmount(event.target.value)}
+                        onChange={(event) => {
+                          setTransactionAmount(event.target.value);
+                          if (transactionErrors.amount) {
+                            setTransactionErrors((previous) => ({ ...previous, amount: "" }));
+                          }
+                        }}
                         placeholder="0.00"
                         required
+                        aria-invalid={Boolean(transactionErrors.amount)}
                       />
                     </div>
                     <small className="field-hint">
@@ -1463,36 +1632,54 @@ export default function App() {
                   </div>
                 </div>
                 <div className="form-grid">
-                  <FormField label="Customer ID" required>
+                  <FormField label="Customer ID" required error={customerUserErrors.customerId}>
                     <input
                       type="number"
                       min="1"
                       step="1"
                       value={customerUserForm.customerId}
-                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, customerId: event.target.value }))}
+                      onChange={(event) => {
+                        setCustomerUserForm((previous) => ({ ...previous, customerId: event.target.value }));
+                        if (customerUserErrors.customerId) {
+                          setCustomerUserErrors((previous) => ({ ...previous, customerId: "" }));
+                        }
+                      }}
                       required
+                      aria-invalid={Boolean(customerUserErrors.customerId)}
                     />
                   </FormField>
-                  <FormField label="Username" required>
+                  <FormField label="Username" required error={customerUserErrors.username}>
                     <input
                       value={customerUserForm.username}
-                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, username: event.target.value }))}
+                      onChange={(event) => {
+                        setCustomerUserForm((previous) => ({ ...previous, username: event.target.value }));
+                        if (customerUserErrors.username) {
+                          setCustomerUserErrors((previous) => ({ ...previous, username: "" }));
+                        }
+                      }}
                       minLength={3}
                       maxLength={64}
                       pattern="[A-Za-z0-9._-]+"
                       autoComplete="off"
                       required
+                      aria-invalid={Boolean(customerUserErrors.username)}
                     />
                   </FormField>
-                  <FormField label="Initial password" required>
+                  <FormField label="Initial password" required error={customerUserErrors.password}>
                     <input
                       type="password"
                       value={customerUserForm.password}
-                      onChange={(event) => setCustomerUserForm((previous) => ({ ...previous, password: event.target.value }))}
+                      onChange={(event) => {
+                        setCustomerUserForm((previous) => ({ ...previous, password: event.target.value }));
+                        if (customerUserErrors.password) {
+                          setCustomerUserErrors((previous) => ({ ...previous, password: "" }));
+                        }
+                      }}
                       minLength={12}
                       maxLength={72}
                       autoComplete="new-password"
                       required
+                      aria-invalid={Boolean(customerUserErrors.password)}
                     />
                     <small className="field-hint">At least 12 characters, no more than 72 bytes.</small>
                   </FormField>
@@ -1508,26 +1695,38 @@ export default function App() {
                   </div>
                 </div>
                 <div className="form-grid">
-                  <FormField label="Username" required>
+                  <FormField label="Username" required error={staffFormErrors.username}>
                     <input
                       value={staffForm.username}
-                      onChange={(event) => setStaffForm((previous) => ({ ...previous, username: event.target.value }))}
+                      onChange={(event) => {
+                        setStaffForm((previous) => ({ ...previous, username: event.target.value }));
+                        if (staffFormErrors.username) {
+                          setStaffFormErrors((previous) => ({ ...previous, username: "" }));
+                        }
+                      }}
                       minLength={3}
                       maxLength={64}
                       pattern="[A-Za-z0-9._-]+"
                       autoComplete="off"
                       required
+                      aria-invalid={Boolean(staffFormErrors.username)}
                     />
                   </FormField>
-                  <FormField label="Temporary password" required>
+                  <FormField label="Temporary password" required error={staffFormErrors.password}>
                     <input
                       type="password"
                       value={staffForm.password}
-                      onChange={(event) => setStaffForm((previous) => ({ ...previous, password: event.target.value }))}
+                      onChange={(event) => {
+                        setStaffForm((previous) => ({ ...previous, password: event.target.value }));
+                        if (staffFormErrors.password) {
+                          setStaffFormErrors((previous) => ({ ...previous, password: "" }));
+                        }
+                      }}
                       minLength={12}
                       maxLength={72}
                       autoComplete="new-password"
                       required
+                      aria-invalid={Boolean(staffFormErrors.password)}
                     />
                     <small className="field-hint">At least 12 characters, no more than 72 bytes.</small>
                   </FormField>
@@ -1587,6 +1786,7 @@ export default function App() {
         </footer>
       </main>
     </div>
+    </>
   );
 }
 
@@ -1830,13 +2030,14 @@ function StatCard({ icon, title, value, description, tone }) {
   );
 }
 
-function FormField({ label, required, wide, children }) {
+function FormField({ label, required, wide, error, children }) {
   return (
-    <label className={`form-field ${wide ? "field-wide" : ""}`}>
+    <label className={`form-field ${wide ? "field-wide" : ""} ${error ? "field-error" : ""}`}>
       <span className="field-label">
         {label} {required && <span className="required-star">*</span>}
       </span>
       {children}
+      {error && <span className="field-error-text" role="alert">{error}</span>}
     </label>
   );
 }

@@ -85,6 +85,92 @@ Successful deposits and withdrawals return a receipt containing `transactionRef`
 
 Atomicity requires the `accounts` and `transactions` tables to use a transactional storage engine such as InnoDB. The banking table definitions are not included in this repository, so verify their storage engines in each deployed database before relying on rollback behavior.
 
+## Backup and recovery procedure
+
+### Daily backup policy
+
+The project uses MySQL with environment variables from the existing server configuration (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`). Backups should be created daily at a quiet time, such as 02:00 local time, and before any schema migration, production release, or data import. Retain at least 30 daily snapshots and keep the latest 7 full backups on a separately secured system or encrypted drive; archive older files after 30 days according to institutional policy.
+
+Use a dedicated backup directory outside the repository working tree, for example:
+
+```powershell
+$env:BACKUP_ROOT = "D:\Backups\bank-management-system"
+```
+
+When running on Windows, the project script stores dumps under `D:\Backups\bank-management-system` unless `BACKUP_ROOT` is set. `mysqldump` writes a timestamped SQL dump and a SHA-256 checksum; backup files are created with restrictive permissions and should be moved to encrypted storage as soon as they are produced.
+
+### Create a backup
+
+From the `server` directory:
+
+```powershell
+npm run backup:db
+```
+
+The command reads the current database configuration from the environment and writes a single timestamped dump such as:
+
+```text
+D:\Backups\bank-management-system\bank_management_system_20261102_020000.sql
+D:\Backups\bank-management-system\bank_management_system_20261102_020000.sql.sha256
+```
+
+The script never logs database credentials or dumps account contents to stdout; it only reports the generated file path and status.
+
+### Restore a backup safely
+
+Never restore directly onto the live database without explicit confirmation. Restore into a different database name in a test or isolated environment by default:
+
+```powershell
+npm run restore:db -- --file "D:\Backups\bank-management-system\bank_management_system_20261102_020000.sql" --target "bank_management_system_restore_test" --confirm
+```
+
+For a non-destructive read-only verification, restore into a disposable database that is not used by the running application. The restore step validates that the selected file exists, is readable, is not empty, and is a MySQL dump. It also verifies the SHA-256 checksum and refuses to overwrite the active `DB_NAME` unless `--confirm` is supplied.
+
+### Verification and recovery check
+
+After a restore, validate the essential data set by checking the recovered `customers`, `accounts`, and `transactions` tables and the key relationships between them. A successful verification confirms that account rows still map to valid customers and transaction rows still map back to valid accounts. Example checklist:
+
+```sql
+SELECT COUNT(*) AS customer_count FROM customers;
+SELECT COUNT(*) AS account_count FROM accounts;
+SELECT COUNT(*) AS transaction_count FROM transactions;
+SELECT COUNT(*)
+FROM accounts a
+LEFT JOIN customers c ON c.customer_id = a.customer_id
+WHERE c.customer_id IS NULL;
+SELECT COUNT(*)
+FROM transactions t
+LEFT JOIN accounts a ON a.account_id = t.account_id
+WHERE a.account_id IS NULL;
+```
+
+Any non-zero orphan count indicates a broken restore or partial data loss and should be treated as a failed recovery check.
+
+### Backup rotation and storage
+
+Recommended retention policy:
+
+- Daily backup, generated every day at the same time.
+- A backup before every schema migration or significant release.
+- Keep 30 daily backups and the newest seven full backups in a separately secured encrypted location.
+- Store the latest valid backup on a different disk or external storage device when possible.
+- Keep a checksum file alongside each dump; verify it before relying on any backup.
+
+Use OS scheduling if automation is unavailable, for example a Windows Task Scheduler job that runs `npm run backup:db` daily. If the deployment environment cannot schedule cron/systemd jobs, document and run the backup command from a dedicated maintenance plan instead of claiming automated scheduling exists.
+
+### Troubleshooting
+
+- If `mysqldump` is not installed, install the MySQL client tools and rerun the command.
+- If the database configuration is missing, ensure `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` are set in the environment or the local `.env` file (which is never committed).
+- If a backup fails, review the safe error message and inspect the MySQL client logs without exposing credentials.
+- If a checksum fails, treat the backup as unusable and generate a fresh dump before restoration.
+
+### Recovery test record
+
+Record the result of each recovery test in a locally stored JSON file outside the repository, for example `D:\Backups\bank-management-system\recovery-tests\recovery-report-20261102.json`. The report includes the backup file name, target database, counts of restored accounts and transactions, orphan-row findings, and status; it intentionally omits sensitive account details or credentials.
+
+This repository does not include a live MySQL integration environment, so the actual database backup and restore procedure was not executed here. Manual verification on a disposable database remains required before the recovery procedure is considered production-ready.
+
 ## Transaction response-time benchmark
 
 Run `npm run benchmark:transactions` from the `server` directory against a dedicated, disposable test database and test account only. The benchmark posts real alternating deposits and withdrawals through the HTTP API, authenticates as a staff/admin test user, and times each response through receipt-body delivery. It requires explicit opt-in with `TRANSACTION_BENCHMARK_ALLOW_MUTATIONS=true`; it does not undo requests, retry failures, or remove transaction records. Do not run it against production or an account with real funds. The even request count keeps the workload balanced when every request succeeds; failed operations are reported and can leave a net balance change.

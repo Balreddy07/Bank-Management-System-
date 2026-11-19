@@ -382,11 +382,12 @@ All backend endpoints are scoped under `/api`.
 | **Auth** | `POST` | `/api/auth/logout` | Terminate session and clear cookie | Yes |
 | **Accounts** | `GET` | `/api/accounts` | List and search customer accounts | Staff / Admin |
 | **Accounts** | `GET` | `/api/accounts/:accountNumber` | Retrieve single account details | Staff / Admin / Owner |
-| **Accounts** | `POST` | `/api/accounts` | Create customer & open account ($\ge ₹500$) | Staff / Admin |
-| **Accounts** | `PATCH` | `/api/accounts/:accountNumber` | Update customer KYC details | Staff / Admin |
-| **Accounts** | `PATCH` | `/api/accounts/:accountNumber/deactivate` | Deactivate account with confirmation | Staff / Admin |
+| **Accounts** | `POST` | `/api/accounts` | Create customer & open account ($\ge ₹500$, Indian phone) | Staff / Admin |
+| **Accounts** | `PATCH` | `/api/accounts/:accountNumber` | Update customer details | Staff / Admin |
+| **Accounts** | `POST` | `/api/accounts/:accountNumber/deactivation-otp` | Generate 6-digit customer approval OTP for deactivation | Staff / Admin |
+| **Accounts** | `PATCH` | `/api/accounts/:accountNumber/deactivate` | Deactivate account (requires zero balance and OTP) | Staff / Admin |
 | **Transactions** | `POST` | `/api/transactions/deposit` | Process account deposit | Staff / Admin |
-| **Transactions** | `POST` | `/api/transactions/withdraw` | Process cash withdrawal ($\ge ₹1,000$ limit) | Staff / Admin |
+| **Transactions** | `POST` | `/api/transactions/withdraw` | Process cash withdrawal ($\ge ₹1,000$ limit or closure) | Staff / Admin |
 | **Transactions** | `GET` | `/api/transactions` | Retrieve account transaction history | Staff / Admin / Owner |
 | **Transactions** | `GET` | `/api/transactions/:transactionRef` | Fetch official transaction receipt | Staff / Admin / Owner |
 | **Reports** | `GET` | `/api/reports` | Date-range financial summary | Admin only |

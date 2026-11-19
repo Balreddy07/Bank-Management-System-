@@ -38,10 +38,10 @@ Exit Criteria Satisfied:                YES
 
 | Req ID | Requirement Description | Verification Method | Associated System Test | Result |
 | :---: | :--- | :--- | :--- | :---: |
-| **FR-1** | Customer KYC onboarding and account opening with $\ge ₹500$ deposit. | Automated API test driving `/api/accounts` with payload validation. | `ST-FR01-ACC-OPEN` | **PASS** |
+| **FR-1** | Customer onboarding, Indian phone validation, auto internal KYC, and opening with $\ge ₹500$ deposit. | Automated API test driving `/api/accounts` with payload validation. | `ST-FR01-ACC-OPEN` | **PASS** |
 | **FR-2** | Automated generation of unique 10-digit account number. | Batch creation of 100 accounts checking length, format, and uniqueness. | `ST-FR02-ACC-NUM` | **PASS** |
-| **FR-3** | Customer account view, detail editing, and status deactivation. | Authenticated staff workflow updating contact info and deactivating account. | `ST-FR03-ACC-MGMT` | **PASS** |
-| **FR-4** | Cash withdrawal with ₹1,000 minimum balance enforcement. | Automated transactions testing withdrawal boundary limits and rejections. | `ST-FR04-WITHDRAW` | **PASS** |
+| **FR-3** | Customer account view, detail editing, and dual-step deactivation (zero balance liquidation + OTP). | Authenticated staff workflow updating contact info, verifying OTP, and deactivating account. | `ST-FR03-ACC-MGMT` | **PASS** |
+| **FR-4** | Cash withdrawal with ₹1,000 minimum balance enforcement and closure liquidation exception. | Automated transactions testing withdrawal boundary limits, closure flag, and rejections. | `ST-FR04-WITHDRAW` | **PASS** |
 | **FR-5** | Unique transaction reference and downloadable receipt retrieval. | Post-transaction receipt generation and retrieval via `/api/transactions/:ref`. | `ST-FR05-RECEIPT` | **PASS** |
 | **FR-6** | 15-minute account lockout after 3 consecutive failed login attempts. | Automated simulation of 3 wrong passwords followed by lockout assertion. | `ST-FR06-LOCKOUT` | **PASS** |
 | **FR-7** | Transaction logging with timestamp, type, amount, and post-balance. | Ledger persistence verification and pagination check on `/api/transactions`. | `ST-FR07-HISTORY` | **PASS** |

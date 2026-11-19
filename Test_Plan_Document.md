@@ -164,8 +164,10 @@ Testing is conducted across multiple levels:
 | Requirement ID | Test Case ID | Test Target File | Verification Scope | Status |
 | :--- | :--- | :--- | :--- | :---: |
 | BMS-F-001 | TC-Auth-01 | security.test.js | User credential check and session creation | PASS |
+| BMS-F-004 | TC-Cust-01 | accounts.test.js | Indian mobile phone format validation and auto internal KYC | PASS |
 | BMS-F-006 | TC-Acc-02 | transactions.test.js | 500 Rupees minimum initial deposit validation | PASS |
-| BMS-F-010 | TC-WD-01 | transactions.test.js | 1,000 Rupees minimum retained balance check | PASS |
+| BMS-F-008 | TC-Acc-04 | accounts.test.js | Dual-step deactivation: zero-balance check and customer OTP verification | PASS |
+| BMS-F-010 | TC-WD-01 | transactions.test.js | 1,000 Rupees minimum retained balance and closure liquidation exception | PASS |
 | BMS-F-014 | TC-Tx-03 | transactions-concurrency.test.js | Idempotency key replay and duplicate prevention | PASS |
 | BMS-NF-001 | TC-Perf-01 | transaction-performance.test.js | 500 concurrent virtual users response under 2s | PASS |
 

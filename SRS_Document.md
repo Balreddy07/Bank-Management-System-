@@ -132,13 +132,13 @@ BMS is a standalone three-tier web application operating in modern browser envir
 | BMS-F-001 | The system shall authenticate Administrator, Staff, and Customer users using verified credentials and issue an HTTP session cookie. | Functional | High | Security | AC: Correct credentials grant access; invalid credentials return HTTP 401. Test: TC-Auth-01 |
 | BMS-F-002 | The system shall hash all stored passwords using bcrypt with a salt work factor of at least 10 and mask password fields on the UI. | Functional | High | Compliance | AC: Raw passwords never appear in database or logs. Test: TC-Auth-02 |
 | BMS-F-003 | The system shall lock any user account for 15 minutes after 3 consecutive failed login attempts and reject subsequent attempts with HTTP 423. | Functional | High | Security | AC: 4th login attempt blocked even with valid password during lockout. Test: TC-Auth-03 |
-| BMS-F-004 | The system shall register customer KYC details including full name, unique phone number, address, and identity proof. | Functional | High | Operations | AC: Missing fields or duplicate phone rejected with HTTP 400/409. Test: TC-Cust-01 |
+| BMS-F-004 | The system shall register customer onboarding details including full name, unique Indian mobile phone number (format ^(?:\+91)?[6-9]\d{9}$), address, and automatically assign an internal compliance verification credential. | Functional | High | Operations | AC: Valid Indian phone numbers accepted; manual ID proof input is not required as internal compliance token is automatically generated. Test: TC-Cust-01 |
 | BMS-F-005 | The system shall automatically generate a unique, non-repeating 10-digit numerical account number upon successful onboarding. | Functional | High | Core Banking | AC: Account number is exactly 10 digits and unique in accounts table. Test: TC-Acc-01 |
 | BMS-F-006 | The system shall mandate an initial deposit of at least 500 Rupees at the time of account creation. | Functional | High | Business Rules | AC: Submissions with initial deposit under 500 Rupees rejected with HTTP 400. Test: TC-Acc-02 |
 | BMS-F-007 | The system shall enable staff and admins to search accounts by account number or customer name substring within 100 results. | Functional | Medium | Operations | AC: Querying name or number returns matching filtered records. Test: TC-Acc-03 |
-| BMS-F-008 | The system shall manage account lifecycle states (ACTIVE and INACTIVE) and require employee confirmation before deactivation. | Functional | High | Compliance | AC: Deactivation requires confirmation; inactive accounts reject mutations. Test: TC-Acc-04 |
+| BMS-F-008 | The system shall enforce dual-step account deactivation: mandating complete balance liquidation down to 0 Rupees first, followed by customer 6-digit OTP verification before marking account INACTIVE. | Functional | High | Compliance | AC: Rejects deactivation with NON_ZERO_BALANCE if balance > 0; requires verified 6-digit customer OTP once balance is 0 Rupees. Test: TC-Acc-04 |
 | BMS-F-009 | The system shall process cash deposits for active accounts, update the ledger atomically, and credit the balance. | Functional | High | Core Banking | AC: Account balance increases by exact deposit amount; transaction row inserted. Test: TC-Dep-01 |
-| BMS-F-010 | The system shall verify that any cash withdrawal leaves at least 1,000 Rupees minimum balance, rejecting violations with HTTP 400. | Functional | High | Business Rules | AC: If balance minus amount is under 1,000 Rupees, withdrawal is aborted. Test: TC-WD-01 |
+| BMS-F-010 | The system shall verify that standard cash withdrawals leave at least 1,000 Rupees minimum balance, while permitting complete balance withdrawal to 0 Rupees for authorized account closure. | Functional | High | Business Rules | AC: Balance under 1,000 Rupees rejected on standard withdrawals; closure withdrawals allow reducing balance to 0 Rupees. Test: TC-WD-01 |
 | BMS-F-011 | The system shall reject any withdrawal or transaction that would result in a negative account balance. | Functional | High | Integrity | AC: Enforced by database CHECK (balance >= 0) and API logic. Test: TC-WD-02 |
 | BMS-F-012 | The system shall generate a unique alphanumeric UUID v4 transaction reference for every completed deposit or withdrawal. | Functional | High | Core Banking | AC: Reference is returned in response header and payload. Test: TC-Tx-01 |
 | BMS-F-013 | The system shall provide an endpoint /api/transactions/:transactionRef to retrieve an official transaction receipt. | Functional | Medium | Customer Service | AC: Calling endpoint returns amount, type, date, and post-balance. Test: TC-Tx-02 |
@@ -212,13 +212,13 @@ BMS is a standalone three-tier web application operating in modern browser envir
 | BMS-F-001 | User Authentication | AuthModule | server/src/auth/routes.js | TC-Auth-01 | PASS |
 | BMS-F-002 | Password Bcrypt Hashing | AuthModule | server/src/auth/routes.js | TC-Auth-02 | PASS |
 | BMS-F-003 | 3-Attempt Lockout | AuthModule | server/src/auth/routes.js | TC-Auth-03 | PASS |
-| BMS-F-004 | Customer KYC Registration | AccountModule | server/src/routes/accounts.js | TC-Cust-01 | PASS |
+| BMS-F-004 | Customer Onboarding & Phone Validation | AccountModule | server/src/routes/accounts.js | TC-Cust-01 | PASS |
 | BMS-F-005 | 10-Digit Account Number | AccountModule | server/src/routes/accounts.js | TC-Acc-01 | PASS |
 | BMS-F-006 | 500 Rupees Initial Deposit | AccountModule | server/src/routes/accounts.js | TC-Acc-02 | PASS |
 | BMS-F-007 | Search and Status Filter | AccountModule | server/src/routes/accounts.js | TC-Acc-03 | PASS |
-| BMS-F-008 | Account Lifecycle Rules | AccountModule | server/src/routes/accounts.js | TC-Acc-04 | PASS |
+| BMS-F-008 | Dual-Step Deactivation (Liquidation & OTP) | AccountModule | server/src/routes/accounts.js | TC-Acc-04 | PASS |
 | BMS-F-009 | Deposit Processing | TxModule | server/src/routes/transactions.js | TC-Dep-01 | PASS |
-| BMS-F-010 | 1,000 Rupees Minimum Balance | TxModule | server/src/routes/transactions.js | TC-WD-01 | PASS |
+| BMS-F-010 | Minimum Balance & Closure Liquidation | TxModule | server/src/routes/transactions.js | TC-WD-01 | PASS |
 | BMS-F-011 | Negative Balance Check | TxModule | 005_enforce_banking_constraints.sql | TC-WD-02 | PASS |
 | BMS-F-012 | Unique Transaction Ref | TxModule | server/src/routes/transactions.js | TC-Tx-01 | PASS |
 | BMS-F-013 | Receipt Retrieval | TxModule | server/src/routes/transactions.js | TC-Tx-02 | PASS |

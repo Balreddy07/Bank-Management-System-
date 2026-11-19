@@ -73,18 +73,22 @@ Access control:
 
 Creates an account and its associated customer record.
 
-Required fields:
+Request parameters:
 
 ```json
 {
   "fullName": "Aditi Rao",
-  "address": "12 MG Road",
+  "address": "12 MG Road, Bangalore",
   "phone": "9876543210",
-  "idProofType": "PAN",
-  "idProofNumber": "ABCDE1234F",
   "initialDeposit": 500
 }
 ```
+
+• `fullName` (required): customer legal name (minimum 2 characters).
+• `address` (required): residential address (minimum 8 characters).
+• `phone` (required): Indian mobile phone format (`^(?:\+91)?[6-9]\d{9}$`).
+• `initialDeposit` (required): minimum opening deposit of 500 Rupees.
+• `idProofType` / `idProofNumber` (optional): automatically assigned internal verification credential (`INTERNAL_VERIFIED`) if omitted.
 
 Access control:
 
@@ -92,17 +96,45 @@ Access control:
 
 Behavior:
 
-- validates KYC values and deposit amount
+- validates customer details and Indian phone format
 - creates a unique 10-digit account number
 - writes the customer and account atomically
+
+### `POST /api/accounts/:accountNumber/deactivation-otp`
+
+Generates and caches a secure 6-digit one-time authorization password (OTP) for account deactivation.
+
+Prerequisite:
+- Account balance must be exactly 0.00 Rupees. If balance > 0, returns HTTP 400 with `NON_ZERO_BALANCE`.
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Deactivation approval OTP generated for customer (+91 9876543210).",
+  "demoOtp": "123456",
+  "phone": "9876543210"
+}
+```
+
+### `PATCH /api/accounts/:accountNumber/deactivate`
+
+Deactivates an account following dual-step verification.
+
+Requirements:
+1. Account balance must be completely liquidated to 0.00 Rupees (rejects with `NON_ZERO_BALANCE` if balance > 0).
+2. Must provide explicit confirmation and valid 6-digit customer OTP:
+
+```json
+{
+  "confirm": true,
+  "otp": "123456"
+}
+```
 
 ### `PATCH /api/accounts/:accountNumber/status`
 
 Updates the status and requires explicit confirmation.
-
-### `PATCH /api/accounts/:accountNumber/deactivate`
-
-Deactivates an account after explicit confirmation.
 
 ### `PATCH /api/accounts/:accountNumber/activate`
 
@@ -136,7 +168,9 @@ The route validates:
 
 ### `POST /api/transactions/withdraw`
 
-Creates a withdrawal with the same validation and integrity rules as deposits, plus a minimum-balance check.
+Creates a withdrawal with balance verification:
+• Enforces standard 1,000 Rupees minimum retained balance policy.
+• Supports `{ "closure": true }` flag to permit full balance liquidation to 0.00 Rupees specifically for account deactivation.
 
 ### `GET /api/transactions?accountNumber=7811288401`
 

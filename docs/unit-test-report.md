@@ -91,8 +91,9 @@ Key verification areas include:
 | Defect ID | Severity | Root Cause | Resolution / Fix | Retest Status |
 | :--- | :---: | :--- | :--- | :---: |
 | **DEF-01** | High | MySQL 8.0 `CHECK` constraints on negative balances produced non-standard error codes on some versions. | Added normalization in migration runner to verify check constraints compatibility. | Verified PASS in `migrations.test.js` |
-| **DEF-02** | Medium | Race condition where concurrent withdrawals on low balance could allow intermediate dirty reads. | Enforced `FOR UPDATE` row lock on account record inside transactional boundary. | Verified PASS in `transactions-concurrency.test.js` |
-| **DEF-03** | Low | Session store cookie expiry time failed to refresh on read-only requests. | Implemented sliding window session touch in authentication middleware. | Verified PASS in `security.test.js` |
+| **DEF-02** | High | Race condition where concurrent withdrawals on low balance could allow intermediate dirty reads. | Enforced `FOR UPDATE` row lock on account record inside transactional boundary. | Verified PASS in `transactions-concurrency.test.js` |
+| **DEF-03** | Medium | Session store cookie expiry time failed to refresh on read-only requests. | Implemented sliding window session touch in authentication middleware. | Verified PASS in `security.test.js` |
+| **DEF-04** | High | Duplicate submissions on network retries causing double-crediting or balance divergence. | Implemented `Idempotency-Key` header verification and cached receipt storage in `transaction_idempotency`. | Verified PASS in `transactions.test.js` |
 
 ---
 

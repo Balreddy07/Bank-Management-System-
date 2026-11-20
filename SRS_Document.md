@@ -235,3 +235,13 @@ BMS is a standalone three-tier web application operating in modern browser envir
 | BMS-SR-003 | HttpOnly Session Cookies | Security | server/src/app.js | TC-Sec-03 | PASS |
 | BMS-SR-004 | RBAC Middleware | Security | server/src/auth/middleware.js | TC-Sec-04 | PASS |
 | BMS-SR-005 | Rate Limiting and Lockout | Security | server/src/auth/routes.js | TC-Sec-05 | PASS |
+
+8.Component (UML) Diagram
+
+The architecture is modelled as three UML 2.0 subsystems. Each cross-tier interface is an assembly connector (ball-and-socket) between boundary ports: the Presentation Tier
+requires ISessionAuth, IAttendanceAPI, IAcademicAPI and IAdminService, which the Application Tier provides, and the Application Tier requires IDataAccess, which the Data
+Tier provides. Dashed arrows labelled use are dependencies between components.
+
+<img width="1107" height="642" alt="image" src="https://github.com/user-attachments/assets/9296ca8d-6228-4328-b842-ed1fea958382" />
+
+   Figure 8.1: Proposed Three-Tier Component Architecture (UML 2.0 Component Diagram)

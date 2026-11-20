@@ -60,6 +60,60 @@ Key backend modules:
 - `server/src/routes/admin.js` — admin staff/customer-user management and audit-log read access
 - `server/src/audit-logger.js` — writes security and operational audit events
 
+### 3.3 Component (UML) Diagram
+
+The architecture is modelled as three UML 2.0 subsystems. Each cross-tier interface is an assembly connector (ball-and-socket) between boundary ports: the Presentation Tier requires ISessionAuth, IAccountAPI, ITransactionAPI, IAdminService and IDeactivationOTP, which the Application Tier provides, and the Application Tier requires IDataAccess, which the Data Tier provides. Dashed arrows labelled use are dependencies between components.
+
+```text
++-------------------------------------------------------------------------------------------------------------------------+
+|                                    UML Component Diagram - Bank Management System (BMS)                                 |
++-------------------------------------------------------------------------------------------------------------------------+
+|                                                                                                                         |
+| +--<<subsystem>>--------------------+  +--<<subsystem>>----------------------------+  +--<<subsystem>>----------------+ |
+| | Presentation Tier (Web Client)    |  | Application Tier (Node.js/Express Backend)|  | Data Tier (MySQL Database)    | |
+| |                                   |  |                                           |  |                               | |
+| |        Internal structure         |  |            Internal structure             |  |      Internal structure       | |
+| |                                   |  |                                           |  |                               | |
+| | +------------------+              |  | +------------------+   <<use>> +--------+ |  |                               | |
+| | | :CustomerPortal  |              |  | |:AuthSessionGuard | - - - - > | :RBAC  | |  |                               | |
+| | | Balance,passbook |              |  | |Session, lockout  |           | Middle | |  |                               | |
+| | +------------------+              |  | +------------------+           | -ware  | |  |                               | |
+| |          |                        |  |                                +--------+ |  |                               | |
+| |       <<use>>                     |  |                                           |  |                               | |
+| |          v                        |  |                                           |  |                               | |
+| | +------------------+  +---------+ |  | +------------------+                      |  |                               | |
+| | | :StaffDesk       |  |:APIClient| | | |:AccountService   |                      |  |                               | |
+| | | Onboard, cashier |->|REST     |[]| |[]|10-digit number  |                      |  |                               | |
+| | +------------------+  |client   |()-O| |Indian phone regex|                      |  |                               | |
+| |          ^            |session  |[]| |[]+------------------+                     |  |                               | |
+| |          |     <<use>>|tokens   | |  |                                +--------+ |  |                               | |
+| |       <<use>>         +---------+ |  | +------------------+   <<use>> |:DBPool | |  | +---------------------------+ | |
+| |          |                 |      |  | |:TransactionEngine| - - - - > |mysql2  |[]| |[]| :MySQLSchema              | | |
+| | +------------------+       |      |  | |Balance guards    |           |pool    |()-O| | Relational tables:         | | |
+| | | :AdminDashboard  |       |      |  | |Closure exception |           +--------+ |  |[]| users, customers,        | | |
+| | | Reports, audit   |- - - -+      |  | +------------------+                ^     |  |  | accounts, transactions,   | | |
+| | +------------------+    <<use>>   |  |          |                          |     |  |  | idempotency_keys,         | | |
+| |                                   |  |       <<use>>                       |     |  |  | security_audit_logs       | | |
+| |                                   |  |          v                          |     |  | +---------------------------+ | |
+| |                                   |  | +------------------+                |     |  |                               | |
+| |                                   |  | |:IdempotencyMgr   | - - - - - - - -+     |  |                               | |
+| |                                   |  | |SHA-256 deduplicat|             <<use>>  |  |                               | |
+| |                                   |  | +------------------+                      |  |                               | |
+| |                                   |  |                                           |  |                               | |
+| |                                   |  | +------------------+                      |  |                               | |
+| |                                   |  | | :OTPService      | - - - - - - - - - - -+  |                               | |
+| |                                   |  | | 6-digit OTP auth |              <<use>> |  |                               | |
+| |                                   |  | +------------------+                      |  |                               | |
+| +-----------------------------------+  +-------------------------------------------+  +-------------------------------+ |
+|                                                                                                                         |
+| Legend:                                                                                                                 |
+| [ ] Component   [] Port (boundary)   --O Provided interface (lollipop)   -( Required interface (socket)  --O)- Assembly |
+| - - - > <<use>> dependency (client uses supplier)                                                                       |
++-------------------------------------------------------------------------------------------------------------------------+
+```
+
+Figure 3.1: Proposed Three-Tier Component Architecture (UML 2.0 Component Diagram)
+
 ## 4. Database architecture
 
 The database is MySQL 8-compatible and uses InnoDB tables. The schema is managed by versioned SQL migrations in `server/migrations/`.
